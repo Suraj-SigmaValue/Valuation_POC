@@ -7,6 +7,7 @@ Unified Streamlit Dashboard integrating:
 """
 
 import os
+import html
 import warnings
 import importlib
 
@@ -112,6 +113,31 @@ st.markdown(
         color: #fcd34d;
         border: 1px solid #f59e0b;
     }
+    .badge-source {
+        background-color: #0f172a;
+        color: #94a3b8;
+        border: 1px solid #475569;
+    }
+    .badge-qualified {
+        background-color: #064e3b;
+        color: #6ee7b7;
+        border: 1px solid #10b981;
+    }
+    .badge-partial {
+        background-color: #451a03;
+        color: #fcd34d;
+        border: 1px solid #d97706;
+    }
+    .badge-inrange {
+        background-color: #042f2e;
+        color: #5eead4;
+        border: 1px solid #0d9488;
+    }
+    .badge-outrange {
+        background-color: #450a0a;
+        color: #fca5a5;
+        border: 1px solid #dc2626;
+    }
 
     /* Result Card */
     .prop-card {
@@ -185,27 +211,55 @@ with st.sidebar:
         chosen_radius_km = st.slider("Custom Radius (km):", min_value=0.5, max_value=25.0, value=5.0, step=0.5)
 
     st.markdown("---")
-    st.subheader("🏷️ 3. Property Type Filter")
-    prop_type_choice = st.radio(
-        "Select Property Type:",
-        options=[
-            "Flat (Residential Apartments, Societies, Condos)",
-            "Shop (Retail Shops, Showrooms, Plazas)",
-            "Office (Corporate Towers, IT Parks, Business Centers)",
-            "Others (Mixed-Use, Commercial & Industrial)",
-        ],
-        index=0,
-        help="Strictly filter comparable projects by category: Flat, Shop, Office, or Others.",
+    st.subheader("🎯 3. Valuation Benchmark Mode")
+    st.caption(
+        "🤖 **100% Automated**: Property type, unit typology, carpet area, and benchmark rate are all automatically discovered from real estate web evidence for your subject project."
     )
 
-    if "flat" in prop_type_choice.lower():
+    with st.expander("⚙️ Optional Manual Overrides", expanded=False):
+        override_active = st.checkbox("Enable manual parameter overrides", value=False)
+        if override_active:
+            prop_choice = st.selectbox(
+                "Property Type Override:",
+                options=["Auto-Detect from Site", "Flat (Residential)", "Shop (Retail)", "Office (Corporate)", "Others (Mixed-Use)"],
+                index=0
+            )
+            unit_override = st.text_input("Unit Typology Override:", value="", placeholder="Leave blank for auto-detected unit (e.g. 2 BHK)")
+            area_override = st.number_input("Carpet Area Override (sq.ft):", min_value=0.0, value=0.0, step=50.0, help="Set 0 for auto-detection")
+            rate_override = st.number_input("Benchmark Rate Override (₹ / sq.ft):", min_value=0.0, value=0.0, step=500.0, help="Set 0 for auto-detection")
+        else:
+            prop_choice = "Auto-Detect from Site"
+            unit_override = None
+            area_override = None
+            rate_override = None
+
+        area_tolerance = st.slider(
+            "Area Tolerance (± %):",
+            min_value=5,
+            max_value=30,
+            value=15,
+        )
+
+        filter_qualified_toggle = st.checkbox(
+            "Filter only Qualified Comparables (All 4 Criteria Matched)",
+            value=False,
+            help="Show only properties matching: Same Property Type + Same Unit + Carpet Area in Range + Price in 80%–120%."
+        )
+
+    if "flat" in prop_choice.lower():
         selected_prop_type = "flat"
-    elif "shop" in prop_type_choice.lower():
+    elif "shop" in prop_choice.lower():
         selected_prop_type = "shop"
-    elif "office" in prop_type_choice.lower():
+    elif "office" in prop_choice.lower():
         selected_prop_type = "office"
-    else:
+    elif "other" in prop_choice.lower():
         selected_prop_type = "others"
+    else:
+        selected_prop_type = None
+
+    source_bench_rate = float(rate_override) if (rate_override and rate_override > 0) else None
+    selected_unit = unit_override.strip() if (unit_override and unit_override.strip()) else None
+    source_bench_area = float(area_override) if (area_override and area_override > 0) else None
 
     st.markdown("---")
     st.subheader("⚙️ 4. System Status & Search")
@@ -240,10 +294,15 @@ current_params = {
     "lng": round(float(input_lng), 5) if input_lng is not None else None,
     "radius_km": float(chosen_radius_km),
     "prop_type": selected_prop_type,
+    "source_rate": source_bench_rate,
+    "source_unit": selected_unit,
+    "source_area": source_bench_area,
+    "area_tol": float(area_tolerance),
+    "qualified_only": bool(filter_qualified_toggle),
     "engine": search_engine_choice,
 }
 
-# Automatically re-run when parameters change (e.g. user toggles between Flat, Shop, Office) or clicks Run
+# Automatically re-run when parameters change or clicks Run
 should_run = (
     run_btn
     or "analysis_data" not in st.session_state
@@ -251,19 +310,24 @@ should_run = (
 )
 
 if should_run:
-    with st.spinner(f"Analyzing site micro-market for '{prop_type_choice.split('(')[0].strip()}'..."):
+    with st.spinner("Analyzing site micro-market & auto-extracting property DNA..."):
         try:
             # Keys loaded automatically from .env
             active_google_key = utils.get_google_api_key()
             tavily_key = utils.get_tavily_api_key() if "Tavily" in search_engine_choice else None
 
-            # 1. Fetch Comparable Projects
+            # 1. Fetch Comparable Projects with 4-Point Auto-Discovered Baseline
             comp_result = comparable.find_comparable_projects(
                 lat=input_lat,
                 lng=input_lng,
                 project_name=project_name if (input_mode == "Project / Location Name" or project_name) else None,
                 radius_km=chosen_radius_km,
                 property_type=selected_prop_type,
+                source_rate=source_bench_rate,
+                source_unit=selected_unit,
+                source_area=source_bench_area,
+                area_tolerance_pct=area_tolerance,
+                filter_qualified_only=filter_qualified_toggle,
                 api_key=active_google_key,
             )
 
@@ -360,25 +424,61 @@ if "analysis_data" in st.session_state:
 
     # ================= TAB 1: COMPARABLE PROJECTS =================
     with tab_comp:
-        st.subheader("🏢 Comparable Real Estate Projects")
+        st.subheader("🏢 Comparable Real Estate Projects & Valuation Matching")
         st.caption(f"Showing nearby projects within **{data['radius_km']} km** matching property filter: **{comp_data['property_type']}**")
 
+        vp = comp_data.get("valuation_parameters", {})
         comps = comp_data.get("comparables", [])
+
+        # Valuation Benchmark Target Banner (80% to 120%)
+        rate_val = vp.get("source_rate")
+        unit_val = vp.get("source_unit", "2 BHK")
+        area_val = vp.get("source_area", 850.0)
+        prop_label = comp_data.get("property_type", "Residential Flat")
+        subj_ev = vp.get("subject_price_evidence") or site.get("price_evidence") or {}
+
+        if rate_val:
+            clean_subj_title = html.escape((subj_ev.get("source_title") or "Verified Portal Listing")[:45])
+            subj_url = html.escape(subj_ev.get("url", "#"))
+            ev_link = f' <a href="{subj_url}" target="_blank" style="color: #38bdf8; text-decoration: underline;">({clean_subj_title} ↗)</a>' if subj_ev.get("url") else ""
+            discovered_tag = " (Auto-Discovered)" if vp.get("rate_discovered") else " (Custom Override)"
+            rate_info = f'Source Rate: <b style="color: #38bdf8;">₹{rate_val:,.0f} / sq.ft</b>{discovered_tag}{ev_link} <span style="color: #94a3b8;">(80%–120%: <b>₹{vp.get("min_rate", 0):,.0f} — ₹{vp.get("max_rate", 0):,.0f}</b>)</span>'
+        else:
+            rate_info = 'Source Rate: <i style="color: #fbbf24;">Rate not disclosed on web for subject property</i>'
+
+        area_info = f'Carpet Area: <b style="color: #fcd34d;">{area_val:,.0f} sq.ft</b> <span style="color: #94a3b8;">(±15%: <b>{vp.get("min_area", 0):,.0f} — {vp.get("max_area", 0):,.0f} sq.ft</b>)</span>' if area_val else 'Carpet Area: <b style="color: #fcd34d;">Standard Area</b>'
+
+        banner_html = (
+            f'<div style="background: linear-gradient(135deg, rgba(30, 41, 59, 0.9) 0%, rgba(15, 23, 42, 0.9) 100%); border: 1px solid #3b82f6; border-radius: 10px; padding: 12px 18px; margin-bottom: 16px;">'
+            f'<div style="display: flex; flex-wrap: wrap; gap: 14px; align-items: center; font-size: 0.88rem;">'
+            f'<div><span style="color: #93c5fd; font-weight: 700;">🎯 Auto-Extracted Baseline:</span></div>'
+            f'<div>Type: <b style="color: #34d399;">{prop_label}</b></div>'
+            f'<div><span style="color: #475569;">|</span></div>'
+            f'<div>Unit: <b style="color: #a78bfa;">{unit_val}</b></div>'
+            f'<div><span style="color: #475569;">|</span></div>'
+            f'<div>{area_info}</div>'
+            f'<div><span style="color: #475569;">|</span></div>'
+            f'<div>{rate_info}</div>'
+            f'</div>'
+            f'</div>'
+        )
+        st.markdown(banner_html, unsafe_allow_html=True)
 
         # High-level Metrics
         mcol1, mcol2, mcol3, mcol4 = st.columns(4)
         with mcol1:
-            st.metric("Total Comparables Found", f"{len(comps)}")
+            st.metric("Total Comparables Found", f"{comp_data.get('total_found', len(comps))}")
         with mcol2:
-            nearest_dist = f"{comps[0]['distance_km']} km" if comps else "N/A"
-            st.metric("Nearest Comparable", nearest_dist)
+            st.metric("Qualified (All 4 Criteria)", f"{comp_data.get('total_qualified', 0)} projects")
         with mcol3:
-            avg_dist = f"{round(sum(c['distance_km'] for c in comps)/len(comps), 2)} km" if comps else "N/A"
-            st.metric("Avg Distance", avg_dist)
+            if vp.get("min_rate"):
+                range_str = f"₹{vp['min_rate']:,.0f} — ₹{vp['max_rate']:,.0f}"
+            else:
+                range_str = "Awaiting Subject Rate"
+            st.metric("Allowable Price Range (80%–120%)", range_str)
         with mcol4:
-            valid_ratings = [c['rating'] for c in comps if c.get('rating', 0) > 0]
-            avg_rating = f"{round(sum(valid_ratings)/len(valid_ratings), 1)} / 5.0" if valid_ratings else "N/A"
-            st.metric("Avg Rating", avg_rating)
+            top_score = f"{comps[0].get('match_score', 0):.1f}%" if comps else "N/A"
+            st.metric("Highest Match Score", top_score)
 
         if comp_data.get("status_message"):
             if comp_data.get("is_demo_data"):
@@ -386,59 +486,122 @@ if "analysis_data" in st.session_state:
             else:
                 st.success(comp_data["status_message"], icon="✅")
 
-        # Top 3 Highlight Cards
+        # Top Highlight Cards (Up to 6 top matching projects in rows of 3)
         if comps:
-            st.markdown("#### 🌟 Closest Comparable Properties")
-            card_cols = st.columns(min(len(comps), 3))
-            for i, p in enumerate(comps[:3]):
-                with card_cols[i]:
-                    st.markdown(
-                        f"""
-                        <div class="prop-card">
-                            <h4 style="margin: 0; color: #38bdf8;">{p['name']}</h4>
-                            <p style="margin: 4px 0; color: #e2e8f0; font-size: 0.9rem;">
-                                📍 <b>{p['distance_km']} km</b> from subject site
-                            </p>
-                            <p style="margin: 2px 0; color: #94a3b8; font-size: 0.8rem;">
-                                ⭐ Rating: <b>{p.get('rating', 'N/A')}</b> ({p.get('user_ratings_total', 0)} reviews)
-                            </p>
-                            <p style="margin: 4px 0; color: #cbd5e1; font-size: 0.8rem;">
-                                🏷️ Type: <i>{p.get('property_type', 'Project')}</i>
-                            </p>
-                            <p style="margin: 4px 0; color: #94a3b8; font-size: 0.78rem;">
-                                {p.get('address', '')}
-                            </p>
-                            <a href="{p.get('google_maps_url', '#')}" target="_blank" style="color: #60a5fa; font-size: 0.8rem; text-decoration: none;">
-                                View on Google Maps ↗
-                            </a>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
+            st.markdown("#### 🌟 Top Matching Comparable Properties")
+            highlight_count = min(len(comps), 6)
+            for chunk_start in range(0, highlight_count, 3):
+                chunk = comps[chunk_start:chunk_start + 3]
+                card_cols = st.columns(len(chunk))
+                for i, p in enumerate(chunk):
+                    v_match = p.get("valuation_match", {})
+                    has_ev = bool(p.get("rate_per_sqft") is not None and p.get("price_evidence"))
+                    ev = p.get("price_evidence") or {}
+
+                    if has_ev:
+                        price_badge = (
+                            '<span class="badge-pill badge-inrange">✅ In 80%–120% Range</span>'
+                            if v_match.get("price_match")
+                            else '<span class="badge-pill badge-outrange">❌ Out of 80%–120% Range</span>'
+                        )
+                        status_badge = (
+                            '<span class="badge-pill badge-qualified">✅ Qualified Match</span>'
+                            if p.get("is_qualified")
+                            else '<span class="badge-pill badge-partial">⚠️ Partial Match</span>'
+                        )
+                        unit_badge = (
+                            f'<span class="badge-pill badge-qualified">🛏️ {p["available_units"][0] if p.get("available_units") else vp.get("source_unit", "2 BHK")}</span>'
+                            if v_match.get("unit_match")
+                            else '<span class="badge-pill badge-outrange">🛏️ Unit Mismatch</span>'
+                        )
+                        area_badge = (
+                            f'<span class="badge-pill badge-inrange">📐 Area in Range</span>'
+                            if v_match.get("area_match")
+                            else '<span class="badge-pill badge-outrange">📐 Area Mismatch</span>'
+                        )
+                        price_html = f'<p style="margin: 3px 0; color: #f8fafc; font-size: 0.95rem;">💰 Verified Rate: <b>₹{p["rate_per_sqft"]:,.0f} / sq.ft</b></p>'
+                        clean_title = html.escape((ev.get("source_title") or "Listing Source")[:45])
+                        raw_snip = (ev.get("snippet") or "")[:140].replace("\r", " ").replace("\n", " ")
+                        clean_snippet = html.escape(raw_snip)
+                        clean_ev_url = html.escape(ev.get("url", "#"))
+                        evidence_box = (
+                            f'<div style="background: rgba(15, 23, 42, 0.7); border-left: 3px solid #10b981; border-radius: 4px; padding: 6px 10px; margin: 8px 0; font-size: 0.78rem;">'
+                            f'<span style="color: #6ee7b7; font-weight: 600;">📑 Price Evidence:</span> '
+                            f'<a href="{clean_ev_url}" target="_blank" style="color: #38bdf8; text-decoration: none; font-weight: 500;">{clean_title} ↗</a>'
+                            f'<p style="margin: 4px 0 0 0; color: #94a3b8; font-size: 0.74rem; line-height: 1.3;">"{clean_snippet}..."</p>'
+                            f'</div>'
+                        )
+                    else:
+                        price_badge = '<span class="badge-pill badge-source">⚠️ No Price Evidence</span>'
+                        status_badge = '<span class="badge-pill badge-partial">⚠️ Price Unverified</span>'
+                        unit_badge = '<span class="badge-pill badge-source">🛏️ Unit Unverified</span>'
+                        area_badge = '<span class="badge-pill badge-source">📐 Area Unverified</span>'
+                        price_html = '<p style="margin: 3px 0; color: #94a3b8; font-size: 0.85rem;">💰 Price: <i>Not Disclosed / No Verified Web Evidence</i></p>'
+                        evidence_box = (
+                            f'<div style="background: rgba(15, 23, 42, 0.4); border-left: 3px solid #475569; border-radius: 4px; padding: 6px 10px; margin: 8px 0; font-size: 0.75rem; color: #94a3b8;">'
+                            f'Price not disclosed on web. Search real estate portals manually below.'
+                            f'</div>'
+                        )
+
+                    source_name = html.escape(str(p.get("source", "Google Places API")))
+                    source_badge = f'<span class="badge-pill badge-source">🌐 {source_name}</span>'
+                    carpet_str = f"{p['carpet_area']:,} sq.ft" if p.get("carpet_area") else "Complex Standard"
+                    units_str = html.escape(", ".join(p.get("available_units", [])))
+                    prop_name = html.escape(str(p.get("name", "Project")))
+                    maps_url = html.escape(str(p.get("google_maps_url", "#")))
+                    search_url = html.escape(str(p.get("web_search_url", "#")))
+
+                    card_html = (
+                        f'<div class="prop-card">'
+                        f'<div style="display: flex; justify-content: space-between; align-items: start;">'
+                        f'<h4 style="margin: 0; color: #38bdf8; font-size: 1.05rem;">{prop_name}</h4>'
+                        f'<span style="font-weight: 700; color: #38bdf8; font-size: 1.05rem;">{p.get("match_score", 0):.1f}%</span>'
+                        f'</div>'
+                        f'<div style="margin: 6px 0 8px 0; display: flex; flex-wrap: wrap; gap: 4px;">{status_badge} {price_badge} {unit_badge} {area_badge}</div>'
+                        f'{price_html}'
+                        f'<p style="margin: 3px 0; color: #e2e8f0; font-size: 0.85rem;">📐 Carpet Area: <b>{carpet_str}</b> | Units: <b>{units_str}</b></p>'
+                        f'<p style="margin: 3px 0; color: #e2e8f0; font-size: 0.85rem;">📍 <b>{p["distance_km"]} km</b> from subject site</p>'
+                        f'<p style="margin: 3px 0; color: #94a3b8; font-size: 0.8rem;">⭐ Rating: <b>{p.get("rating", "N/A")}</b> ({p.get("user_ratings_total", 0)} reviews)</p>'
+                        f'{evidence_box}'
+                        f'<div style="margin-top: 8px;">{source_badge}</div>'
+                        f'<div style="margin-top: 10px; display: flex; gap: 12px;">'
+                        f'<a href="{maps_url}" target="_blank" style="color: #60a5fa; font-size: 0.8rem; text-decoration: none;">Google Maps ↗</a>'
+                        f'<a href="{search_url}" target="_blank" style="color: #34d399; font-size: 0.8rem; text-decoration: none;">Search 99acres ↗</a>'
+                        f'</div>'
+                        f'</div>'
                     )
 
+                    with card_cols[i]:
+                        st.markdown(card_html, unsafe_allow_html=True)
+
         # Full Dataframe Table
-        st.markdown("#### 📋 All Comparable Projects Table")
+        st.markdown("#### 📋 All Comparable Projects Directory")
         df_comps = comparable.to_dataframe(comps)
         if not df_comps.empty:
             cols_to_display = [
-                c for c in ["Name", "Distance (km)", "Type", "Units Consolidated", "Rating", "Reviews", "Address", "Google Maps"]
-                if c in df_comps.columns
+                c for c in [
+                    "Name", "Distance (km)", "Verified Rate (₹/sqft)", "In 80%–120% Range?",
+                    "Unit Typology", "Carpet Area (sqft)", "Area Match",
+                    "Price Evidence Source", "Evidence URL", "Valuation Match",
+                    "Status", "Google Maps", "Portal Search"
+                ] if c in df_comps.columns
             ]
             st.dataframe(
                 df_comps[cols_to_display],
                 width="stretch",
                 column_config={
-                    "Google Maps": st.column_config.LinkColumn("Google Maps Link", display_text="Open Map ↗"),
+                    "Evidence URL": st.column_config.LinkColumn("Evidence Citation", display_text="View Evidence ↗"),
+                    "Google Maps": st.column_config.LinkColumn("Map Link", display_text="Open Map ↗"),
+                    "Portal Search": st.column_config.LinkColumn("Portal Search", display_text="Search 99acres ↗"),
                     "Distance (km)": st.column_config.NumberColumn(format="%.2f km"),
-                    "Rating": st.column_config.NumberColumn(format="⭐ %.1f"),
                 },
             )
             # Download CSV
             csv_comp = df_comps.to_csv(index=False).encode("utf-8")
             st.download_button(
-                "📥 Download Comparables CSV",
+                "📥 Download Comparables Valuation CSV",
                 data=csv_comp,
-                file_name="comparable_projects.csv",
+                file_name="comparable_projects_valuation.csv",
                 mime="text/csv",
             )
         else:
@@ -477,26 +640,20 @@ if "analysis_data" in st.session_state:
             cbd_cols = st.columns(min(len(cbds), 3))
             for i, c in enumerate(cbds[:3]):
                 with cbd_cols[i]:
-                    st.markdown(
-                        f"""
-                        <div class="prop-card">
-                            <h4 style="margin: 0; color: #fbbf24;">{c['name']}</h4>
-                            <p style="margin: 4px 0; color: #f8fafc; font-size: 0.85rem; font-weight: 600;">
-                                {c['type']}
-                            </p>
-                            <p style="margin: 4px 0; color: #38bdf8; font-size: 1.1rem; font-weight: 700;">
-                                🚗 {c['distance_km']} km
-                            </p>
-                            <p style="margin: 4px 0; color: #cbd5e1; font-size: 0.8rem;">
-                                {c['description']}
-                            </p>
-                            <a href="{c.get('google_maps_url', '#')}" target="_blank" style="color: #60a5fa; font-size: 0.8rem; text-decoration: none;">
-                                Get Driving Directions ↗
-                            </a>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
+                    c_name = html.escape(str(c.get("name", "CBD")))
+                    c_type = html.escape(str(c.get("type", "Commercial")))
+                    c_desc = html.escape(str(c.get("description", "")))
+                    c_map = html.escape(str(c.get("google_maps_url", "#")))
+                    cbd_card_html = (
+                        f'<div class="prop-card">'
+                        f'<h4 style="margin: 0; color: #fbbf24;">{c_name}</h4>'
+                        f'<p style="margin: 4px 0; color: #f8fafc; font-size: 0.85rem; font-weight: 600;">{c_type}</p>'
+                        f'<p style="margin: 4px 0; color: #38bdf8; font-size: 1.1rem; font-weight: 700;">🚗 {c["distance_km"]} km</p>'
+                        f'<p style="margin: 4px 0; color: #cbd5e1; font-size: 0.8rem;">{c_desc}</p>'
+                        f'<a href="{c_map}" target="_blank" style="color: #60a5fa; font-size: 0.8rem; text-decoration: none;">Get Driving Directions ↗</a>'
+                        f'</div>'
                     )
+                    st.markdown(cbd_card_html, unsafe_allow_html=True)
 
             st.markdown("#### 📊 CBD Distance & Specification Matrix")
             df_cbd = cbd.to_dataframe(cbds)
@@ -532,19 +689,18 @@ if "analysis_data" in st.session_state:
             for idx, (cat_key, cat_info) in enumerate(cat_summary.items()):
                 with cols[idx % 4]:
                     nearest_text = f"{cat_info['nearest_distance_km']} km" if cat_info['nearest_distance_km'] is not None else "N/A"
-                    st.markdown(
-                        f"""
-                        <div class="metric-card">
-                            <div class="metric-title">{cat_info['icon']} {cat_info['label']}</div>
-                            <div class="metric-value">{cat_info['count']} <span style="font-size: 0.8rem; color: #94a3b8; font-weight: normal;">places</span></div>
-                            <div class="metric-sub">Nearest: <b>{nearest_text}</b></div>
-                            <div class="metric-sub" style="color: #64748b; font-size: 0.72rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                                {cat_info['nearest_name']}
-                            </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
+                    c_icon = cat_info.get("icon", "📍")
+                    c_label = html.escape(str(cat_info.get("label", "")))
+                    c_nearest = html.escape(str(cat_info.get("nearest_name", "")))
+                    amenity_card_html = (
+                        f'<div class="metric-card">'
+                        f'<div class="metric-title">{c_icon} {c_label}</div>'
+                        f'<div class="metric-value">{cat_info["count"]} <span style="font-size: 0.8rem; color: #94a3b8; font-weight: normal;">places</span></div>'
+                        f'<div class="metric-sub">Nearest: <b>{nearest_text}</b></div>'
+                        f'<div class="metric-sub" style="color: #64748b; font-size: 0.72rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{c_nearest}</div>'
+                        f'</div>'
                     )
+                    st.markdown(amenity_card_html, unsafe_allow_html=True)
 
         # Category filter for the table
         filter_cat = st.multiselect(

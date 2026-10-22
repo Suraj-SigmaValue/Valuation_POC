@@ -270,6 +270,7 @@ def search_google_places_nearby(
                     "user_ratings_total": item.get("user_ratings_total", 0),
                     "types": item.get("types", []),
                     "business_status": item.get("business_status", "OPERATIONAL"),
+                    "source": "Google Places API",
                     "google_maps_url": f"https://www.google.com/maps/place/?q=place_id:{item.get('place_id')}",
                 })
             return places, None
@@ -334,6 +335,7 @@ def search_google_places_text(
                     "user_ratings_total": item.get("user_ratings_total", 0),
                     "types": item.get("types", []),
                     "business_status": item.get("business_status", "OPERATIONAL"),
+                    "source": "Google Places API",
                     "google_maps_url": f"https://www.google.com/maps/place/?q=place_id:{item.get('place_id')}",
                 })
             return places, None
@@ -344,3 +346,48 @@ def search_google_places_text(
             return [], f"Google Places API Error: {err}"
     except Exception as e:
         return [], f"Network error: {str(e)}"
+
+
+def search_duckduckgo(query: str, max_results: int = 4) -> List[Dict[str, str]]:
+    """Execute DuckDuckGo search with warning suppression."""
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                from ddgs import DDGS
+            except ImportError:
+                from duckduckgo_search import DDGS
+
+            results = []
+            with DDGS() as ddgs:
+                raw_res = list(ddgs.text(query, max_results=max_results))
+                for item in raw_res:
+                    results.append({
+                        "title": item.get("title", ""),
+                        "snippet": item.get("body", ""),
+                        "url": item.get("href", ""),
+                    })
+            return results
+    except Exception:
+        return []
+
+
+def search_tavily(query: str, api_key: str, max_results: int = 4) -> List[Dict[str, str]]:
+    """Execute Tavily AI search."""
+    try:
+        from tavily import TavilyClient
+
+        client = TavilyClient(api_key=api_key)
+        res = client.search(query=query, search_depth="basic", max_results=max_results)
+        results = []
+        for item in res.get("results", []):
+            results.append({
+                "title": item.get("title", ""),
+                "snippet": item.get("content", ""),
+                "url": item.get("url", ""),
+            })
+        return results
+    except Exception:
+        return []
+

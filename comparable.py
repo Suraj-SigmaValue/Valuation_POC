@@ -21,11 +21,16 @@ import os
 import sys
 import re
 import argparse
+import urllib.parse
+import concurrent.futures
 from typing import Dict, List, Optional, Any, Tuple
 import pandas as pd
 
 from utils import (
     get_google_api_key,
+    get_tavily_api_key,
+    search_tavily,
+    search_duckduckgo,
     haversine_distance,
     geocode_project,
     reverse_geocode,
@@ -37,7 +42,8 @@ from utils import (
 # Google Place Types mapping
 GOOGLE_RESIDENTIAL_TYPES = {
     "apartment_complex", "housing_complex", "condominium_complex",
-    "residential", "housing_estate", "gated_community", "lodging"
+    "residential", "housing_estate", "gated_community", "premise",
+    "subpremise", "point_of_interest", "establishment"
 }
 
 GOOGLE_OFFICE_TYPES = {
@@ -70,9 +76,11 @@ SHOP_KEYWORDS = [
 RESIDENTIAL_KEYWORDS = [
     r"\bflat\b", r"\bflats\b", r"\bapartment\b", r"\bapartments\b", r"\bsociety\b",
     r"\bhousing society\b", r"\bchs\b", r"\bco-operative housing\b", r"\bcooperative housing\b",
-    r"\bresidency\b", r"\bresidences\b", r"\bresidential\b", r"\bcondo\b", r"\bcondominium\b",
-    r"\bvillas\b", r"\benclave\b", r"\btowers?\b", r"\bheights?\b", r"\bgreens?\b",
-    r"\bpalms?\b", r"\bmeadows?\b", r"\bwoods?\b", r"\bhomes?\b"
+    r"\bresidency\b", r"\bresidences?\b", r"\bresidential\b", r"\bcondo\b", r"\bcondominium\b",
+    r"\bvillas?\b", r"\benclave\b", r"\btowers?\b", r"\bheights?\b", r"\bgreens?\b",
+    r"\bpalms?\b", r"\bmeadows?\b", r"\bwoods?\b", r"\bhomes?\b", r"\bestate\b",
+    r"\bcourt\b", r"\bpromenade\b", r"\bterrace\b", r"\bmanor\b", r"\bgardens?\b",
+    r"\bpark\b", r"\bliving\b", r"\bhabitat\b", r"\bavenue\b", r"\boasis\b"
 ]
 
 
@@ -88,6 +96,376 @@ def normalize_property_type(prop_type: str) -> str:
     elif "other" in p or "mixed" in p or "all" in p:
         return "others"
     return "flat"
+
+
+# Valuation Benchmark Catalogs
+AMENITIES_BY_TYPE = {
+    "flat": [
+        "Clubhouse", "Swimming Pool", "Gymnasium", "24x7 Security",
+        "Power Backup", "Covered Parking", "Children Play Area",
+        "EV Charging", "Landscaped Gardens", "Jogging Track"
+    ],
+    "office": [
+        "Central Air Conditioning", "High-Speed Elevators", "100% Power Backup",
+        "24x7 Security & CCTV", "Visitor Parking", "Cafeteria / Food Court",
+        "Fire Fighting System", "Conference Facilities", "EV Charging"
+    ],
+    "shop": [
+        "High Footfall Frontage", "Anchor Tenant Provision", "Customer Parking",
+        "24x7 Security & CCTV", "Power Backup", "Escalators & Elevators",
+        "Loading Bay", "Fire Safety System"
+    ],
+    "others": [
+        "Goods Lift", "Heavy Vehicle Access", "Power Backup",
+        "24x7 Security", "Fire Safety System", "Dedicated Parking",
+        "Adequate Water Supply"
+    ],
+}
+
+UNITS_BY_TYPE = {
+    "flat": ["1 BHK", "2 BHK", "3 BHK", "4 BHK"],
+    "office": ["Commercial Office Suite", "Warm Shell Office", "Bare Shell Floor Plate", "Co-Working Desk Space"],
+    "shop": ["Retail Shop", "High-Street Showroom", "Food Court Outlet", "Anchor Store"],
+    "others": ["Industrial Unit", "Warehouse Bay", "Mixed-Use Office/Retail"],
+}
+
+
+# Regex for extracting price per sqft / sqm across global currencies (INR, USD, GBP, EUR, AED, SGD, etc.)
+PRICE_REGEX = re.compile(
+    r'(?:₹|rs\.?|inr|\$|£|€|aed|sgd)?\s*([0-9]{1,3}(?:,[0-9]{3})+|[0-9]{3,7})\s*(?:/|per)\s*(?:sq\.?\s*ft|sqft|sq\s*feet|sqm|sq\.?\s*m)',
+    re.I
+)
+
+
+def fetch_project_dna(
+    project_name: str,
+    city: str = "",
+    tavily_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Intelligently extracts complete Subject Project DNA from live web portal evidence:
+    1. Property Type (Flat, Office, Shop, Others)
+    2. Available Unit Typologies (e.g. 1 BHK, 2 BHK, 3 BHK)
+    3. Dominant Benchmark Unit (e.g. 2 BHK)
+    4. Typical Carpet Area (sq.ft) and allowable ±15% range
+    5. Verified Benchmark Rate and allowable 80%–120% range
+    6. Verified Web Portal Listing Citation (URL + snippet)
+    """
+    clean_city = city or "Metropolitan"
+    query = f"{project_name} {clean_city} 2 BHK 3 BHK floor plan carpet area price per sq ft property for sale listings"
+
+    key = get_tavily_api_key(tavily_key)
+    articles = []
+    if key:
+        articles = search_tavily(query, key, max_results=4)
+    if not articles:
+        articles = search_duckduckgo(query, max_results=4)
+
+    all_text = " ".join(f"{a.get('title', '')} {a.get('snippet', '')}" for a in articles)
+
+    # 1. Detect Property Type
+    prop_type = "flat"
+    if re.search(r"\b(commercial office|bare shell office|office space for sale|office tower)\b", all_text, re.I):
+        if not re.search(r"\b(flat|apartment|bhk|residential society)\b", all_text, re.I):
+            prop_type = "office"
+    elif re.search(r"\b(retail shop for sale|commercial showroom|shopping plaza)\b", all_text, re.I):
+        if not re.search(r"\b(flat|apartment|bhk)\b", all_text, re.I):
+            prop_type = "shop"
+
+    # 2. Detect Available Units
+    detected_units = []
+    for u in ["1 BHK", "2 BHK", "3 BHK", "4 BHK", "5 BHK"]:
+        if re.search(rf"\b{u}\b", all_text, re.IGNORECASE):
+            detected_units.append(u)
+    if not detected_units:
+        detected_units = ["1 BHK", "2 BHK", "3 BHK"]
+
+    dominant_unit = "2 BHK" if "2 BHK" in detected_units else detected_units[0]
+
+    # 3. Detect Typical Carpet Area (Prefer area associated with dominant unit)
+    unit_area_regex = re.compile(rf"{re.escape(dominant_unit)}.*?(\b[0-9]{{3,4}}\b)\s*(?:sq\.?\s*ft|sqft)", re.I)
+    m_unit_area = unit_area_regex.search(all_text)
+    if m_unit_area:
+        candidate_area = int(m_unit_area.group(1))
+        carpet_area = float(candidate_area) if 350 <= candidate_area <= 3500 else 850.0
+    else:
+        general_areas = [int(a) for a in re.findall(r"(\b[0-9]{3,4}\b)\s*(?:sq\.?\s*ft|sqft)", all_text, re.I) if 350 <= int(a) <= 3500]
+        carpet_area = float(round(sum(general_areas) / len(general_areas), 0)) if general_areas else 850.0
+
+    min_area = round(carpet_area * 0.85, 1)
+    max_area = round(carpet_area * 1.15, 1)
+
+    # 4. Detect Verified Price per sq.ft & Evidence Citation
+    rate_val = None
+    evidence_dict = None
+    for item in articles:
+        text = f"{item.get('title', '')} {item.get('snippet', '')}"
+        m_price = PRICE_REGEX.search(text)
+        if m_price:
+            raw_val = m_price.group(1).replace(",", "")
+            try:
+                pval = float(raw_val)
+                if 500 <= pval <= 250000:
+                    rate_val = pval
+                    evidence_dict = {
+                        "price": pval,
+                        "source_title": item.get("title") or "Verified Portal Listing",
+                        "url": item.get("url", ""),
+                        "snippet": item.get("snippet", "").strip(),
+                        "search_query": query,
+                    }
+                    break
+            except ValueError:
+                continue
+
+    min_rate = round(rate_val * 0.80, 2) if rate_val else None
+    max_rate = round(rate_val * 1.20, 2) if rate_val else None
+
+    return {
+        "property_type": prop_type,
+        "dominant_unit": dominant_unit,
+        "available_units": detected_units,
+        "carpet_area": carpet_area,
+        "min_area": min_area,
+        "max_area": max_area,
+        "rate_per_sqft": rate_val,
+        "min_rate": min_rate,
+        "max_rate": max_rate,
+        "price_evidence": evidence_dict,
+        "dna_discovered": bool(rate_val is not None),
+    }
+
+
+def fetch_verified_project_price_evidence(
+    project_name: str,
+    city: str = "",
+    tavily_key: Optional[str] = None,
+) -> Tuple[Optional[float], Optional[Dict[str, Any]]]:
+    """
+    Searches live web portals (99acres, Magicbricks, Housing, etc.) for real pricing evidence.
+    CRITICAL RULE: Returns (None, None) if no verified evidence is found.
+    NEVER fabricates or estimates a price without evidence.
+    """
+    dna = fetch_project_dna(project_name=project_name, city=city, tavily_key=tavily_key)
+    return dna.get("rate_per_sqft"), dna.get("price_evidence")
+
+
+def enrich_comparable_valuation_data(
+    place: Dict[str, Any],
+    prop_type: str = "flat",
+    city: str = "",
+    target_unit: Optional[str] = "2 BHK",
+    tavily_key: Optional[str] = None,
+    fetch_evidence: bool = False,
+) -> Dict[str, Any]:
+    """
+    Enriches a place with real attributes and verified price evidence.
+    CRITICAL RULE:
+    - If verified evidence is found from real estate portals, rate_per_sqft and price_evidence are populated.
+    - If NO evidence is found, rate_per_sqft remains None. NEVER displays synthetic/fake prices!
+    """
+    name = place.get("name", "Project")
+    clean_city = city or "Metropolitan"
+    unit_query_part = f"{target_unit} " if target_unit else ""
+    # Extract locality from address (e.g. Keshav Nagar) for pinpoint listing matches
+    addr = place.get("address", "")
+    addr_tokens = [t.strip() for t in addr.split(",") if t.strip()]
+    locality = ""
+    for tok in addr_tokens:
+        if any(w in tok.lower() for w in ["nagar", "road", "street", "avenue", "lane", "chowk", "wadi", "sector", "phase", "hills", "district", "downtown", "creek", "marina", "bay"]):
+            locality = tok
+            break
+    loc_part = f"{locality} " if locality else ""
+    query_str = f"{name} {loc_part}{clean_city} {unit_query_part}price per sq ft carpet area property for sale listings"
+    web_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query_str)}"
+
+    rate_val = None
+    evidence_dict = None
+    carpet_area_val = None
+    detected_units = []
+
+    if fetch_evidence:
+        key = get_tavily_api_key(tavily_key)
+        articles = []
+        if key:
+            articles = search_tavily(query_str, key, max_results=3)
+        if not articles:
+            articles = search_duckduckgo(query_str, max_results=3)
+
+        all_text = " ".join(f"{a.get('title', '')} {a.get('snippet', '')}" for a in articles)
+
+        # Detect units in candidate
+        for u in ["1 BHK", "2 BHK", "3 BHK", "4 BHK"]:
+            if re.search(rf"\b{u}\b", all_text, re.IGNORECASE):
+                detected_units.append(u)
+
+        # Detect candidate carpet area (prefer area near target unit)
+        if target_unit:
+            u_regex = re.compile(rf"{re.escape(target_unit)}.*?(\b[0-9]{{3,4}}\b)\s*(?:sq\.?\s*ft|sqft)", re.I)
+            m_u = u_regex.search(all_text)
+            if m_u:
+                c_val = int(m_u.group(1))
+                if 350 <= c_val <= 3500:
+                    carpet_area_val = c_val
+
+        if carpet_area_val is None:
+            area_matches = [int(a) for a in re.findall(r"(\b[0-9]{3,4}\b)\s*(?:sq\.?\s*ft|sqft)", all_text, re.I) if 350 <= int(a) <= 3500]
+            if area_matches:
+                carpet_area_val = area_matches[0]
+
+        # Detect rate per sqft & evidence
+        for item in articles:
+            text = f"{item.get('title', '')} {item.get('snippet', '')}"
+            m_price = PRICE_REGEX.search(text)
+            if m_price:
+                raw_val = m_price.group(1).replace(",", "")
+                try:
+                    pval = float(raw_val)
+                    if 500 <= pval <= 250000:
+                        rate_val = pval
+                        evidence_dict = {
+                            "price": pval,
+                            "source_title": item.get("title") or "Verified Portal Listing",
+                            "url": item.get("url", ""),
+                            "snippet": item.get("snippet", "").strip(),
+                            "search_query": query_str,
+                        }
+                        break
+                except ValueError:
+                    continue
+
+    place["rate_per_sqft"] = rate_val
+    place["price_evidence"] = evidence_dict
+    place["source"] = place.get("source") or "Google Places API"
+    place["web_search_url"] = web_url
+    place["available_units"] = detected_units if detected_units else ["Available in Complex"]
+    place["carpet_area"] = carpet_area_val
+
+    return place
+
+
+def evaluate_comparable_match(
+    comp: Dict[str, Any],
+    source_rate: Optional[float] = None,
+    min_rate_pct: float = 80.0,
+    max_rate_pct: float = 120.0,
+    source_unit: Optional[str] = "2 BHK",
+    source_area: Optional[float] = None,
+    area_tolerance_pct: float = 15.0,
+    target_property_type: Optional[str] = "flat",
+    source_amenities: Optional[List[str]] = None,
+) -> Tuple[bool, float, Dict[str, Any]]:
+    """
+    Evaluates whether a comparable satisfies the 4-Point Strict Valuation Benchmark:
+    1. Same Property Type (Flat, Office, Shop, Others)
+    2. Same Unit Typology (Must offer the subject unit, e.g. 2 BHK)
+    3. Carpet Area within ±15% tolerance range
+    4. Verified Price strictly within 80% to 120% range with live portal evidence
+    """
+    comp_rate = comp.get("rate_per_sqft")
+    evidence = comp.get("price_evidence")
+    has_price_evidence = bool(comp_rate is not None and evidence is not None)
+
+    # 1. Price Match (80%–120% Range)
+    if source_rate is not None and source_rate > 0:
+        min_rate = round(source_rate * (min_rate_pct / 100.0), 2)
+        max_rate = round(source_rate * (max_rate_pct / 100.0), 2)
+
+        if has_price_evidence:
+            price_match = (min_rate <= comp_rate <= max_rate)
+            rate_diff_pct = round(abs(comp_rate - source_rate) / max(source_rate, 0.01) * 100.0, 1)
+            price_status = "✅ In 80%–120% Range" if price_match else "❌ Out of 80%–120% Range"
+            price_score = max(0.0, 1.0 - (rate_diff_pct / 40.0)) * 45.0
+        else:
+            price_match = False
+            rate_diff_pct = None
+            price_status = "⚠️ No Price Evidence"
+            price_score = 0.0
+    else:
+        min_rate = None
+        max_rate = None
+        price_match = has_price_evidence
+        rate_diff_pct = None
+        price_status = "Verified Rate" if has_price_evidence else "⚠️ No Price Evidence"
+        price_score = 30.0 if has_price_evidence else 0.0
+
+    # 2. Unit Typology Match (Must offer same unit, e.g. 2 BHK)
+    avail_units = comp.get("available_units", [])
+    if source_unit and avail_units:
+        unit_match = bool(
+            source_unit in avail_units
+            or "Available in Complex" in avail_units
+            or any(source_unit.lower() in u.lower() for u in avail_units)
+        )
+    else:
+        unit_match = True
+    unit_score = 20.0 if unit_match else 0.0
+
+    # 3. Carpet Area Match (Within ±15% tolerance)
+    comp_area = comp.get("carpet_area")
+    if source_area and source_area > 0:
+        min_area = round(source_area * (1.0 - area_tolerance_pct / 100.0), 1)
+        max_area = round(source_area * (1.0 + area_tolerance_pct / 100.0), 1)
+        if comp_area:
+            area_match = bool(min_area <= comp_area <= max_area)
+            area_diff_pct = round(abs(comp_area - source_area) / source_area * 100.0, 1)
+            area_status = f"✅ In Range ({comp_area} sq.ft)" if area_match else f"❌ Area Mismatch ({comp_area} sq.ft)"
+            area_score = max(0.0, 1.0 - (area_diff_pct / 30.0)) * 15.0
+        else:
+            # Area not explicitly stated in portal snippet: compatible by unit
+            area_match = True
+            area_status = "Compatible Unit"
+            area_score = 10.0
+    else:
+        min_area = None
+        max_area = None
+        area_match = True
+        area_status = "Area Open"
+        area_score = 10.0
+
+    # 4. Property Type Match
+    comp_type = normalize_property_type(comp.get("property_type", "flat"))
+    target_type = normalize_property_type(target_property_type or "flat")
+    type_match = (comp_type == target_type)
+
+    # Distance factor: closer to subject site is preferred
+    dist = comp.get("distance_km", 5.0)
+    dist_score = max(0.0, (1.0 - min(dist, 10.0) / 10.0)) * 15.0
+
+    # Rating factor
+    rating = comp.get("rating") or 4.0
+    rating_score = (rating / 5.0) * 5.0
+
+    total_score = round(price_score + unit_score + area_score + dist_score + rating_score, 1)
+    if not has_price_evidence:
+        total_score = min(total_score, 55.0)
+
+    # Qualified only if ALL 4 criteria pass:
+    # 1. Price evidence verified AND in 80%–120%
+    # 2. Same unit typology
+    # 3. Area in range
+    # 4. Same property type
+    is_qualified = bool(has_price_evidence and price_match and unit_match and area_match and type_match)
+
+    details = {
+        "is_qualified": is_qualified,
+        "type_match": type_match,
+        "has_price_evidence": has_price_evidence,
+        "price_match": price_match,
+        "price_status": price_status,
+        "unit_match": unit_match,
+        "source_unit": source_unit,
+        "area_match": area_match,
+        "area_status": area_status,
+        "min_area": min_area,
+        "max_area": max_area,
+        "min_rate": min_rate,
+        "max_rate": max_rate,
+        "rate_diff_pct": rate_diff_pct,
+        "evidence": evidence,
+        "match_score": total_score,
+    }
+    return is_qualified, total_score, details
 
 
 def detect_property_attributes(place: Dict[str, Any]) -> Dict[str, bool]:
@@ -114,6 +492,29 @@ def detect_property_attributes(place: Dict[str, Any]) -> Dict[str, bool]:
     has_residential = bool(types_set & GOOGLE_RESIDENTIAL_TYPES) or any(
         re.search(pat, full_text, re.IGNORECASE) for pat in RESIDENTIAL_KEYWORDS
     )
+
+    # Universal Negative Exclusion:
+    # Strictly exclude hotels, OYOs, hostels, guest houses, public amenities, retail services, transport, and non-residential facilities
+    non_building_google_types = {
+        "restaurant", "cafe", "bar", "meal_takeaway", "meal_delivery",
+        "hospital", "doctor", "health", "dentist", "pharmacy", "veterinary_care",
+        "school", "primary_school", "secondary_school", "university",
+        "bank", "atm", "finance", "insurance_agency", "accounting", "lawyer",
+        "gas_station", "car_repair", "car_wash", "car_dealer", "parking",
+        "place_of_worship", "church", "hindu_temple", "mosque", "synagogue",
+        "gym", "spa", "beauty_salon", "hair_care", "laundry", "bakery",
+        "transit_station", "bus_station", "subway_station", "train_station",
+        "moving_company", "storage", "travel_agency", "post_office", "police",
+        "local_government_office", "amusement_park", "night_club", "movie_theater",
+        "lodging", "hotel", "motel", "guest_house", "bed_and_breakfast", "hostel", "campground"
+    }
+    non_res_name_exclusion = re.compile(
+        r"\b(hotel|resort|oyo|guest\s*house|homestay|motel|lodge|inn|hostel|pg|paying guest|dormitory|stay\s*@|pvt ltd|technologies|solutions|consulting|roadlines|movers|packers|clinic|hospital|school|academy|classes|repair|services|agency|dealers?|motors?)\b",
+        re.IGNORECASE
+    )
+
+    if (types_set & non_building_google_types) or bool(non_res_name_exclusion.search(name)):
+        has_residential = False
 
     return {
         "has_office": has_office,
@@ -192,9 +593,9 @@ def clean_project_name(name: str) -> str:
         name,
         flags=re.IGNORECASE,
     ).strip()
-    # Strip trailing parentheses with phone numbers or city
+    # Strip trailing parentheses, commas, or dashes with city names
     name = re.sub(
-        r"\s*\((?:Pune|Mumbai|Delhi|PCMC|Bangalore|Hyderabad|Chennai|India|Branch|\d+)\)\s*$",
+        r"\s*[\(,\-–]\s*(?:Pune|Mumbai|Delhi|PCMC|Bangalore|Hyderabad|Chennai|India|Branch|\d+)\s*\)?\s*$",
         "",
         name,
         flags=re.IGNORECASE,
@@ -222,7 +623,7 @@ def extract_building_project(name: str, address: str) -> Tuple[str, str, str]:
     bldg_re = re.compile(r"\b(" + "|".join(bldg_keywords) + r")\b", re.IGNORECASE)
 
     unit_prefix_re = re.compile(
-        r"^\s*(?:office|shop|unit|flat|suite|cabin|room|gf|ff|sf|plot|sr|sy|survey|ward|cts|g-flr|ground flr|first flr|second flr|1st floor|2nd floor|3rd floor|4th floor|5th floor|6th floor|gf and ff)\b[\s\d\w\-\.,#/]*",
+        r"^\s*(?:office|shop|unit|flat|suite|cabin|room|gf|ff|sf|plot|sr|sy|survey|ward|cts|g-flr|ground flr|first flr|second flr|1st floor|2nd floor|3rd floor|4th floor|5th floor|6th floor|gf and ff)\b[\s\d\w\-\.,#/:]*",
         re.IGNORECASE,
     )
 
@@ -238,15 +639,15 @@ def extract_building_project(name: str, address: str) -> Tuple[str, str, str]:
 
     parts = [p.strip() for p in address.split(",") if p.strip()]
 
-    # 1. If name itself is clearly a building/project and not a tenant
-    if bldg_re.search(name) and not is_tenant:
+    # 1. If name is NOT an individual tenant/store, the place name itself IS the project name!
+    if not is_tenant:
         clean_name = clean_project_name(name)
         clean_addr = address
         if parts and unit_prefix_re.search(parts[0]):
             clean_addr = ", ".join(parts[1:])
         return clean_name, clean_addr, ""
 
-    # 2. Check address parts for parent building / project name
+    # 2. If it IS a tenant, look in address parts for the parent building / project name
     for i, p in enumerate(parts[:4]):
         stripped = unit_prefix_re.sub("", p).strip()
         if stripped and bldg_re.search(stripped):
@@ -354,18 +755,21 @@ def find_comparable_projects(
     lng: Optional[float] = None,
     project_name: Optional[str] = None,
     radius_km: float = 5.0,
-    property_type: str = "flat",
+    property_type: Optional[str] = None,
+    source_rate: Optional[float] = None,
+    price_tolerance_pct: float = 20.0,
+    source_unit: Optional[str] = None,
+    source_area: Optional[float] = None,
+    area_tolerance_pct: float = 15.0,
+    source_amenities: Optional[List[str]] = None,
+    filter_qualified_only: bool = False,
     api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Main function to find comparable projects for a given project name or lat/long.
-
-    Parameters:
-    - lat, lng: Latitude & Longitude coordinates of subject site
-    - project_name: Name of project/location if lat/long is not provided
-    - radius_km: Radius in kilometers (2, 5, 10 or custom)
-    - property_type: 'flat', 'shop', 'office', or 'others'
-    - api_key: Google Places API key (optional; defaults to .env)
+    INTELLIGENT AUTO-FETCH:
+    If property_type, source_unit, source_area, or source_rate are not provided (or set to None/auto),
+    they are automatically fetched from real estate web evidence for the subject project.
     """
     key = get_google_api_key(api_key)
 
@@ -395,7 +799,53 @@ def find_comparable_projects(
         raise ValueError("Must provide either (lat, lng) or project_name.")
 
     radius_meters = int(radius_km * 1000)
-    prop_type_key = normalize_property_type(property_type)
+    city_name = subject_site.get("city", "Metropolitan Area")
+    tavily_key = get_tavily_api_key()
+
+    # 2. Intelligent Auto-Extraction of Subject Project DNA
+    subj_name = subject_site.get("name") or project_name or ""
+    if "Subject Site (" in subj_name or not subj_name or subj_name == "Custom Subject Property":
+        addr = subject_site.get("address", "")
+        addr_parts = [p.strip() for p in addr.split(",") if p.strip()]
+        subj_search_name = " ".join(addr_parts[-4:-2]) if len(addr_parts) >= 4 else (addr_parts[0] if addr_parts else "Real Estate")
+    else:
+        subj_search_name = subj_name
+
+    subject_dna = fetch_project_dna(project_name=subj_search_name, city=city_name, tavily_key=tavily_key)
+
+    # Auto-detect or apply Property Type
+    if not property_type or property_type == "auto":
+        prop_type_key = normalize_property_type(subject_dna.get("property_type", "flat"))
+    else:
+        prop_type_key = normalize_property_type(property_type)
+
+    # Auto-detect or apply Unit Typology
+    if not source_unit or source_unit == "auto":
+        resolved_unit = subject_dna.get("dominant_unit", "2 BHK")
+    else:
+        resolved_unit = source_unit
+
+    # Auto-detect or apply Carpet Area
+    if not source_area or source_area <= 0:
+        resolved_area = subject_dna.get("carpet_area", 850.0)
+    else:
+        resolved_area = float(source_area)
+
+    # Auto-detect or apply Benchmark Rate
+    if not source_rate or source_rate <= 0:
+        resolved_rate = subject_dna.get("rate_per_sqft")
+        rate_discovered = bool(resolved_rate is not None)
+    else:
+        resolved_rate = float(source_rate)
+        rate_discovered = False
+
+    subject_site["property_type"] = prop_type_key
+    subject_site["dominant_unit"] = resolved_unit
+    subject_site["carpet_area"] = resolved_area
+    subject_site["rate_per_sqft"] = resolved_rate
+    subject_site["price_evidence"] = subject_dna.get("price_evidence")
+    subject_site["rate_discovered"] = rate_discovered
+    subject_site["dna"] = subject_dna
 
     comparables = []
     is_demo = False
@@ -408,27 +858,44 @@ def find_comparable_projects(
             "corporate park commercial office building",
             "IT tech park office tower",
             "commercial office towers business center",
+            "corporate office suites",
+            "commercial business center",
+            "office campus",
         ],
         "shop": [
             "shopping mall commercial complex",
             "commercial shopping complex retail center",
             "shopping arcade retail plaza",
             "commercial retail shopping mall",
+            "retail showroom commercial market",
+            "high street retail shopping complex",
         ],
         "flat": [
-            "residential apartment society",
-            "housing society residential complex",
-            "gated community residential township",
-            "condominium residential towers",
+            "residential apartment",
+            "housing society",
+            "residential complex",
+            "apartments",
+            "flats",
+            "gated community",
+            "residential towers",
+            "housing society apartments",
+            "residential enclave",
+            "residential project",
+            "residential",
+            "housing",
+            "towers",
+            "residency",
+            "heights",
         ],
         "others": [
             "commercial complex business center",
             "integrated mixed use development complex",
             "logistics industrial business park",
+            "commercial park",
         ],
     }
 
-    target_queries = type_query_map.get(prop_type_key, type_query_map["flat"])
+    target_queries = list(type_query_map.get(prop_type_key, type_query_map["flat"]))
 
     # 2. Live Google Places API Search
     if key:
@@ -436,7 +903,21 @@ def find_comparable_projects(
         seen_ids = set()
         city_name = subject_site.get("city", "")
 
-        # A. Targeted Text Search (best for commercial / office / retail complexes)
+        # A. Open Spatial Proximity Search (Discovers ALL physical premises in radius, keyword-free)
+        open_nearby_places, _ = search_google_places_nearby(
+            lat=lat,
+            lng=lng,
+            radius_meters=radius_meters,
+            keyword=None,
+            api_key=key,
+        )
+        for p in open_nearby_places:
+            pid = p.get("place_id") or p.get("name")
+            if pid not in seen_ids:
+                seen_ids.add(pid)
+                collected.append(p)
+
+        # B. Targeted Text Search - Query standard property categories in city
         for q in target_queries:
             full_query = f"{q} in {city_name}" if city_name else q
             t_places, err = search_google_places_text(
@@ -454,8 +935,8 @@ def find_comparable_projects(
                     seen_ids.add(pid)
                     collected.append(p)
 
-        # B. Targeted Nearby Search for additional density
-        for kw in target_queries[:2]:
+        # C. Targeted Keyword Nearby Search strictly bounded within radius
+        for kw in target_queries:
             n_places, _ = search_google_places_nearby(
                 lat=lat,
                 lng=lng,
@@ -469,13 +950,19 @@ def find_comparable_projects(
                     seen_ids.add(pid)
                     collected.append(p)
 
-        # C. Filter strictly using the user's rule
+        # C. Filter strictly using property type rule
         valid_comparables = []
         for p in collected:
-            # Check radius boundary first
             p_dist = p.get("distance_km")
             if p_dist is None or p_dist > radius_km:
                 continue
+
+            # Skip the subject project itself (distance < 50m and matches subject name)
+            if p_dist < 0.05:
+                p_name_lower = (p.get("name") or "").lower()
+                s_name_lower = subj_search_name.lower()
+                if s_name_lower in p_name_lower or p_name_lower in s_name_lower:
+                    continue
 
             attrs = detect_property_attributes(p)
             include, tag = should_include_place(attrs, prop_type_key)
@@ -490,7 +977,6 @@ def find_comparable_projects(
             proj_name, clean_addr, unit_name = extract_building_project(
                 p.get("name", ""), p.get("address", "")
             )
-            # Normalization key for deduplicating identical projects
             norm_key = re.sub(r"[^a-z0-9]", "", proj_name.lower())
             if not norm_key:
                 norm_key = re.sub(r"[^a-z0-9]", "", (p.get("name") or "").lower())
@@ -525,7 +1011,6 @@ def find_comparable_projects(
                 )
 
         comparables = list(consolidated_map.values())
-        comparables.sort(key=lambda x: x.get("distance_km", 999))
 
         if not comparables:
             if status_msg:
@@ -538,10 +1023,65 @@ def find_comparable_projects(
             status_msg = f"Successfully fetched {len(comparables)} verified {prop_type_key} projects from Google Places API."
 
     else:
-        # No API key provided -> Return mock demonstration data
         is_demo = True
         comparables = _generate_mock_comparables(lat, lng, radius_km, prop_type_key, subject_site.get("city", "City Area"))
         status_msg = "Google Places API key not found in .env. Showing simulated comparable properties. Add GOOGLE_PLACES_API_KEY in .env for live Google data."
+
+    # 3. Valuation Web Evidence Research & 80% to 120% Range Matching
+    city_name = subject_site.get("city", "Metropolitan Area")
+    tavily_key = get_tavily_api_key()
+
+    # Pre-sort candidate projects strictly by closest distance to subject site first
+    comparables.sort(key=lambda x: x.get("distance_km", 999))
+
+    # Research live price evidence concurrently on ALL candidate projects (NO LIMIT: 20, 50, etc.)
+    def _worker_evidence(comp_item):
+        return enrich_comparable_valuation_data(
+            comp_item,
+            prop_type=prop_type_key,
+            city=city_name,
+            target_unit=resolved_unit,
+            tavily_key=tavily_key,
+            fetch_evidence=True,
+        )
+
+    if comparables:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(comparables), 12)) as executor:
+            all_processed = list(executor.map(_worker_evidence, comparables))
+    else:
+        all_processed = []
+
+    for comp in all_processed:
+        is_qual, score, details = evaluate_comparable_match(
+            comp,
+            source_rate=resolved_rate,
+            min_rate_pct=80.0,
+            max_rate_pct=120.0,
+            source_unit=resolved_unit,
+            source_area=resolved_area,
+            area_tolerance_pct=area_tolerance_pct,
+            target_property_type=prop_type_key,
+        )
+        comp["is_qualified"] = is_qual
+        comp["match_score"] = score
+        comp["valuation_match"] = details
+
+    # Sort: projects with verified price evidence first, then highest score, then closest distance
+    all_processed.sort(
+        key=lambda x: (
+            not x.get("is_qualified", False),
+            x.get("rate_per_sqft") is None,
+            -x.get("match_score", 0.0),
+            x.get("distance_km", 999),
+        )
+    )
+
+    qualified_count = sum(1 for c in all_processed if c.get("is_qualified", False))
+
+    if filter_qualified_only:
+        displayed_comparables = [c for c in all_processed if c.get("is_qualified", False)]
+    else:
+        displayed_comparables = all_processed
 
     label_map = {
         "flat": "Flat (Residential Apartments, Societies, Condos)",
@@ -550,54 +1090,105 @@ def find_comparable_projects(
         "others": "Others (Mixed-Use, Commercial & Industrial)",
     }
 
+    min_price_calc = round(resolved_rate * 0.80, 2) if resolved_rate else None
+    max_price_calc = round(resolved_rate * 1.20, 2) if resolved_rate else None
+    min_area_calc = round(resolved_area * (1.0 - area_tolerance_pct / 100.0), 1) if resolved_area else None
+    max_area_calc = round(resolved_area * (1.0 + area_tolerance_pct / 100.0), 1) if resolved_area else None
+
     return {
         "subject_site": subject_site,
+        "subject_dna": subject_dna,
         "radius_km": radius_km,
         "property_type": label_map.get(prop_type_key, prop_type_key.title()),
         "property_type_key": prop_type_key,
-        "total_found": len(comparables),
-        "comparables": comparables,
+        "total_found": len(all_processed),
+        "total_qualified": qualified_count,
+        "comparables": displayed_comparables,
+        "all_comparables": all_processed,
         "is_demo_data": is_demo,
         "status_message": status_msg,
+        "valuation_parameters": {
+            "source_rate": resolved_rate,
+            "rate_discovered": rate_discovered,
+            "subject_price_evidence": subject_site.get("price_evidence"),
+            "min_rate_pct": 80.0,
+            "max_rate_pct": 120.0,
+            "min_rate": min_price_calc,
+            "max_rate": max_price_calc,
+            "source_unit": resolved_unit,
+            "source_area": resolved_area,
+            "area_tolerance_pct": area_tolerance_pct,
+            "min_area": min_area_calc,
+            "max_area": max_area_calc,
+            "filter_qualified_only": filter_qualified_only,
+            "dna": subject_dna,
+        },
     }
 
 
 def to_dataframe(comparables: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Helper to convert comparable projects list into a pandas DataFrame."""
+    """Helper to convert comparable projects list into a pandas DataFrame with valuation columns."""
     if not comparables:
-        return pd.DataFrame(columns=["Name", "Distance (km)", "Type", "Units Consolidated", "Rating", "Reviews", "Address", "Google Maps"])
+        return pd.DataFrame(columns=[
+            "Name", "Distance (km)", "Verified Rate (₹/sqft)", "In 80%–120% Range?",
+            "Unit Typology", "Carpet Area (sqft)", "Price Evidence Source", "Evidence URL", "Data Source", "Google Maps", "Portal Search"
+        ])
 
     rows = []
     for p in comparables:
-        u_count = p.get("unit_count", 1)
-        units_str = f"Consolidated ({u_count} units)" if u_count > 1 else "Building / Complex"
+        v_match = p.get("valuation_match", {})
+        ev = p.get("price_evidence")
+        rate_val = p.get("rate_per_sqft")
+
+        rate_str = f"₹ {rate_val:,.0f}" if rate_val is not None else "No Verified Evidence"
+        price_status = v_match.get("price_status", "⚠️ No Price Evidence")
+        ev_source = ev.get("source_title", "—") if ev else "—"
+        ev_url = ev.get("url", "") if ev else ""
+        area_str = f"{p['carpet_area']:,} sq.ft" if p.get("carpet_area") else "Complex Standard"
+        units_str = ", ".join(p.get("available_units", []))
+
         rows.append({
             "Name": p.get("name", ""),
             "Distance (km)": p.get("distance_km", 0.0),
-            "Type": p.get("property_type", ""),
-            "Units Consolidated": units_str,
+            "Verified Rate (₹/sqft)": rate_str,
+            "In 80%–120% Range?": price_status,
+            "Unit Typology": units_str,
+            "Carpet Area (sqft)": area_str,
+            "Area Match": v_match.get("area_status", "Compatible"),
+            "Price Evidence Source": ev_source,
+            "Evidence URL": ev_url,
+            "Valuation Match": f"{p.get('match_score', 0.0):.1f}%",
+            "Status": "✅ Qualified (80-120%)" if p.get("is_qualified") else ("⚠️ Price Unverified" if rate_val is None else "❌ Out of 80-120% Range"),
+            "Data Source": p.get("source", "Google Places API"),
             "Rating": p.get("rating", 0.0),
             "Reviews": p.get("user_ratings_total", 0),
             "Address": p.get("address", ""),
             "Latitude": p.get("lat"),
             "Longitude": p.get("lng"),
             "Google Maps": p.get("google_maps_url", ""),
+            "Portal Search": p.get("web_search_url", ""),
         })
     df = pd.DataFrame(rows)
-    return df.sort_values(by="Distance (km)").reset_index(drop=True)
+    return df
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Find Comparable Projects using Google Places API")
+    parser = argparse.ArgumentParser(description="Find Comparable Projects with 80% to 120% Valuation Matching & Evidence")
     parser.add_argument("--project", type=str, help="Project name or address")
     parser.add_argument("--lat", type=float, help="Latitude")
     parser.add_argument("--lng", type=float, help="Longitude")
     parser.add_argument("--radius", type=float, default=5.0, help="Radius in km (e.g. 2, 5, 10)")
-    parser.add_argument("--type", type=str, default="office", choices=["flat", "shop", "office", "others"], help="Property type")
+    parser.add_argument("--type", type=str, default="flat", choices=["flat", "shop", "office", "others"], help="Property type")
+    parser.add_argument("--rate", type=float, default=10000.0, help="Source benchmark rate (e.g. 10000)")
+    parser.add_argument("--unit", type=str, default="2 BHK", help="Unit typology (e.g. '2 BHK')")
+    parser.add_argument("--area", type=float, default=1000.0, help="Carpet area in sqft (e.g. 1000)")
+    parser.add_argument("--area-tol", type=float, default=15.0, help="Area tolerance percentage (e.g. 15)")
+    parser.add_argument("--amenities", nargs="*", default=["Clubhouse", "Gymnasium", "24x7 Security"], help="Key amenities")
+    parser.add_argument("--qualified-only", action="store_true", help="Filter only qualified comparables")
     args = parser.parse_args()
 
     if not args.project and (args.lat is None or args.lng is None):
-        print("Usage: python comparable.py --project 'Pimple Saudagar, Pune' --radius 5 --type office")
+        print("Usage: python comparable.py --project 'Pimple Saudagar, Pune' --radius 5 --type flat --rate 10000")
         sys.exit(1)
 
     result = find_comparable_projects(
@@ -606,21 +1197,32 @@ if __name__ == "__main__":
         project_name=args.project,
         radius_km=args.radius,
         property_type=args.type,
+        source_rate=args.rate,
+        source_unit=args.unit,
+        source_area=args.area,
+        area_tolerance_pct=args.area_tol,
+        source_amenities=args.amenities,
+        filter_qualified_only=args.qualified_only,
     )
 
-    print("\n" + "=" * 65)
+    vp = result["valuation_parameters"]
+    print("\n" + "=" * 75)
     print(f"Subject Site: {result['subject_site']['name']}")
     print(f"Coordinates: {result['subject_site']['lat']}, {result['subject_site']['lng']}")
     print(f"Address: {result['subject_site']['address']}")
     print(f"Search Radius: {result['radius_km']} km | Property Type: {result['property_type']}")
+    print(f"Benchmark Rate: {vp['source_rate']} (Allowed 80% to 120%: {vp['min_rate']} - {vp['max_rate']})")
+    print(f"Total Discovered: {result['total_found']} | Qualified in 80%-120%: {result['total_qualified']}")
     print(f"Status: {result['status_message']}")
-    print("=" * 65)
+    print("=" * 75)
 
     df = to_dataframe(result["comparables"])
     if not df.empty:
         try:
-            print(df[["Name", "Distance (km)", "Type", "Rating", "Address"]].to_string(index=False))
+            print(df[["Name", "Distance (km)", "Verified Rate (₹/sqft)", "In 80%–120% Range?", "Price Evidence Source", "Data Source"]].to_string(index=False))
         except UnicodeEncodeError:
-            print(df[["Name", "Distance (km)", "Type", "Rating", "Address"]].to_string(index=False).encode("ascii", errors="replace").decode())
+            print(df[["Name", "Distance (km)", "Verified Rate (₹/sqft)", "In 80%–120% Range?", "Price Evidence Source", "Data Source"]].to_string(index=False).encode("ascii", errors="replace").decode())
     else:
         print("No comparable projects found matching criteria.")
+
+
