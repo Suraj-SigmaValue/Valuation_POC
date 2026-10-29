@@ -15,6 +15,7 @@ import os
 import sys
 import re
 import argparse
+import concurrent.futures
 from typing import Dict, List, Optional, Any
 import pandas as pd
 
@@ -299,34 +300,37 @@ def fetch_neighborhood_amenities(
     # 2. Query Google Places API if key available
     if key:
         collected = []
+        def _fetch_amenity_worker(cat_key, kw):
+            res, _ = search_google_places_nearby(
+                lat=lat, lng=lng, radius_meters=radius_meters, keyword=kw, api_key=key
+            )
+            return cat_key, res or []
+
+        tasks = []
         for cat_key in target_cats:
             cat_cfg = AMENITY_CATEGORIES.get(cat_key)
-            if not cat_cfg:
-                continue
+            if cat_cfg:
+                for kw in cat_cfg.get("keywords", [])[:2]:
+                    tasks.append((cat_key, kw))
 
-            # Query primary types/keywords
-            for kw in cat_cfg["keywords"][:2]:
-                places, err = search_google_places_nearby(
-                    lat=lat,
-                    lng=lng,
-                    radius_meters=radius_meters,
-                    keyword=kw,
-                    api_key=key,
-                )
-                if err:
-                    status_msg = err
-                for p in places:
-                    pid = p.get("place_id") or p.get("name")
-                    if pid not in seen_place_ids and p.get("distance_km") is not None and p["distance_km"] <= radius_km:
-                        # Validate transit amenities to filter out false positives (e.g. car garages, food chains)
-                        if cat_key in ("metro", "bus", "railway") and not is_valid_transit_amenity(p, cat_key):
-                            continue
-                        seen_place_ids.add(pid)
-                        p["category"] = cat_key
-                        p["category_label"] = cat_cfg["label"]
-                        p["icon"] = cat_cfg["icon"]
-                        collected.append(p)
-
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tasks), 10)) as ex:
+            futures = [ex.submit(_fetch_amenity_worker, ck, kw) for ck, kw in tasks]
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    cat_key, places = fut.result()
+                    cat_cfg = AMENITY_CATEGORIES.get(cat_key, {})
+                    for p in places:
+                        pid = p.get("place_id") or p.get("name")
+                        if pid not in seen_place_ids and p.get("distance_km") is not None and p["distance_km"] <= radius_km:
+                            if cat_key in ("metro", "bus", "railway") and not is_valid_transit_amenity(p, cat_key):
+                                continue
+                            seen_place_ids.add(pid)
+                            p["category"] = cat_key
+                            p["category_label"] = cat_cfg.get("label", cat_key.title())
+                            p["icon"] = cat_cfg.get("icon", "📍")
+                            collected.append(p)
+                except Exception:
+                    pass
         if collected:
             collected.sort(key=lambda x: x.get("distance_km", 999))
             amenities = collected

@@ -1,2 +1,6 @@
 .env
 venv
+*.db
+__pycache__/
+
+.quota_status.json

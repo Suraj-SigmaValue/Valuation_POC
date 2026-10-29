@@ -21,6 +21,7 @@ import sys
 import re
 import warnings
 import argparse
+import concurrent.futures
 from typing import Dict, List, Optional, Any, Tuple, TypedDict
 import pandas as pd
 
@@ -29,12 +30,18 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 from langgraph.graph import StateGraph, START, END
 
 from utils import (
+    parse_coordinates,
     haversine_distance,
     geocode_project,
     reverse_geocode,
     get_tavily_api_key,
     get_google_api_key,
+    get_openai_api_key,
     search_google_places_text,
+    search_web_with_fallback,
+    search_duckduckgo,
+    search_tavily,
+    search_openai_web,
 )
 
 
@@ -275,6 +282,7 @@ class CBDDeepAgentState(TypedDict):
     lng: Optional[float]
     search_engine: str
     tavily_key: Optional[str]
+    openai_key: Optional[str]
     google_key: Optional[str]
 
     # Location resolution
@@ -358,7 +366,28 @@ def init_location_node(state: CBDDeepAgentState) -> Dict[str, Any]:
 
     trace = list(state.get("agent_thought_trace", []))
 
-    if project_name and (lat is None or lng is None):
+    coords_in_name = parse_coordinates(project_name) if project_name else None
+    if coords_in_name and (lat is None or lng is None):
+        lat, lng = coords_in_name
+
+    if lat is not None and lng is not None:
+        rev = reverse_geocode(lat, lng, api_key=google_key)
+        is_generic = (
+            not project_name
+            or coords_in_name is not None
+            or any(g in (project_name or "").lower() for g in ["custom subject", "subject site", "my valuation", "unknown"])
+        )
+        resolved_name = project_name if (project_name and not is_generic) else (
+            rev.get("name") or rev.get("formatted_address", "").split(",")[0].strip() or f"Subject Site ({lat:.4f}, {lng:.4f})"
+        )
+        subject_site = {
+            "name": resolved_name,
+            "lat": lat,
+            "lng": lng,
+            "address": rev.get("formatted_address", f"{lat:.5f}, {lng:.5f}"),
+            "city": rev.get("city", "Mumbai"),
+        }
+    elif project_name:
         geo = geocode_project(project_name, api_key=google_key)
         lat = geo["lat"]
         lng = geo["lng"]
@@ -368,15 +397,6 @@ def init_location_node(state: CBDDeepAgentState) -> Dict[str, Any]:
             "lng": lng,
             "address": geo.get("formatted_address", ""),
             "city": geo.get("city", "Mumbai"),
-        }
-    elif lat is not None and lng is not None:
-        rev = reverse_geocode(lat, lng, api_key=google_key)
-        subject_site = {
-            "name": project_name or f"Subject Site ({lat:.4f}, {lng:.4f})",
-            "lat": lat,
-            "lng": lng,
-            "address": rev.get("formatted_address", ""),
-            "city": rev.get("city", "Mumbai"),
         }
     else:
         subject_site = {
@@ -437,41 +457,68 @@ def plan_deep_research_node(state: CBDDeepAgentState) -> Dict[str, Any]:
 
 def execute_deep_web_search_node(state: CBDDeepAgentState) -> Dict[str, Any]:
     """
-    Node 3: Executes web search for all planned query vectors and aggregates web intelligence.
+    Node 3: Executes multi-tier web search with resilient fallback (1. OpenAI -> 2. DuckDuckGo -> 3. Tavily).
+    Fast-tracks institutional metropolitan markets with pre-verified benchmarks in < 0.01s.
     """
-    queries = state["planned_queries"]
-    engine = state.get("search_engine", "duckduckgo").lower()
-    tavily_key = get_tavily_api_key(state.get("tavily_key"))
+    metro_key = state.get("metro_region", "").lower()
+    metro_display = state.get("metro_display", "Metropolitan Area")
     trace = list(state.get("agent_thought_trace", []))
 
-    engine_used = "DuckDuckGo"
+    # Fast-track: Institutional metro markets have certified CBD benchmarks in KNOWN_METRO_CBDS
+    if metro_key in KNOWN_METRO_CBDS:
+        trace.append({
+            "step": "Web Intelligence Execution",
+            "thought": f"Recognized institutional metropolitan market '{metro_display}'. Sourcing verified macro CBD corridors and spatial micro-market hubs directly.",
+        })
+        return {
+            "web_sources": [],
+            "search_engine_used": "Institutional CBD Intelligence",
+            "agent_thought_trace": trace,
+        }
+
+    queries = state["planned_queries"]
+    engine = state.get("search_engine", "auto").lower()
+    tavily_key = get_tavily_api_key(state.get("tavily_key"))
+    openai_key = get_openai_api_key(state.get("openai_key"))
+    trace = list(state.get("agent_thought_trace", []))
+
     all_results = []
     seen_urls = set()
+    used_engines = set()
 
-    for q in queries:
-        res = []
-        if "tavily" in engine and tavily_key:
-            res = _search_tavily(q, tavily_key, max_results=3)
-            engine_used = "Tavily AI Search"
+    def _search_worker(q):
+        return search_web_with_fallback(
+            q,
+            max_results=3,
+            tavily_key=tavily_key,
+            openai_key=openai_key,
+            preferred_engine=engine,
+        )
 
-        if not res:
-            res = _search_duckduckgo(q, max_results=3)
-            engine_used = "DuckDuckGo"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(queries), 4)) as ex:
+        futures = {ex.submit(_search_worker, q): q for q in queries}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                res, eng = fut.result()
+                if eng != "None":
+                    used_engines.add(eng)
+                for item in res:
+                    url = item.get("url")
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        all_results.append(item)
+            except Exception:
+                pass
 
-        for item in res:
-            url = item.get("url")
-            if url and url not in seen_urls:
-                seen_urls.add(url)
-                all_results.append(item)
-
+    engine_summary = ", ".join(sorted(used_engines)) if used_engines else "DuckDuckGo / Web"
     trace.append({
         "step": "Web Intelligence Execution",
-        "thought": f"Executed deep search using {engine_used}. Retrieved {len(all_results)} intelligence articles across all query vectors.",
+        "thought": f"Executed deep search using {engine_summary}. Retrieved {len(all_results)} intelligence articles across all query vectors.",
     })
 
     return {
         "web_sources": all_results,
-        "search_engine_used": engine_used,
+        "search_engine_used": engine_summary,
         "agent_thought_trace": trace,
     }
 
@@ -672,12 +719,13 @@ def analyze_cbd(
     lat: Optional[float] = None,
     lng: Optional[float] = None,
     project_name: Optional[str] = None,
-    search_engine: str = "duckduckgo",
+    search_engine: str = "auto",
     tavily_key: Optional[str] = None,
+    openai_key: Optional[str] = None,
     google_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Public entry point to run the LangGraph Deep Agent for CBD analysis.
+    Public entry point to run the LangGraph Deep Agent for CBD analysis with fallback support.
     """
     initial_state: CBDDeepAgentState = {
         "project_name": project_name,
@@ -685,6 +733,7 @@ def analyze_cbd(
         "lng": lng,
         "search_engine": search_engine,
         "tavily_key": tavily_key,
+        "openai_key": openai_key,
         "google_key": google_key,
         "subject_site": {},
         "city": "",

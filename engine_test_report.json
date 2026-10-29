@@ -1,0 +1,204 @@
+{
+  "duckduckgo": {
+    "error": null,
+    "raw_count": 5,
+    "developer": "VTP Realty",
+    "developer_tier": "Tier 2 (Reputed Regional)",
+    "status": "Under Construction",
+    "units": [
+      "1 BHK",
+      "2 BHK",
+      "3 BHK"
+    ],
+    "carpet_area": 902.0,
+    "area_evidence": "Portal snippet: \"...3 BHK 902 sq.ft...\"",
+    "rate_per_sqft": null,
+    "price_evidence": null,
+    "total_comps": 49,
+    "qualified_comps": 10,
+    "market_rate": null,
+    "iqr_range": null,
+    "top_candidates": [
+      {
+        "Name": "Blue Ridge, Tower 7 (T7)",
+        "Distance (km)": 1.13,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 9,241",
+        "Unit Typology": "1 BHK, 2 BHK, 3 BHK, 4 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "77.0%"
+      },
+      {
+        "Name": "Godrej Elements",
+        "Distance (km)": 0.18,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 9,048",
+        "Unit Typology": "2 BHK, 3 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "73.8%"
+      },
+      {
+        "Name": "Palm Springs",
+        "Distance (km)": 2.59,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 8,885",
+        "Unit Typology": "1 BHK, 2 BHK, 3 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "66.8%"
+      },
+      {
+        "Name": "Wisteriaa Cooperative Housing Society",
+        "Distance (km)": 2.77,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 10,310",
+        "Unit Typology": "3 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "57.3%"
+      },
+      {
+        "Name": "Blue Ridge Main Entry",
+        "Distance (km)": 0.84,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 9,924",
+        "Unit Typology": "2 BHK, 3 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "61.7%"
+      }
+    ]
+  },
+  "openai": {
+    "error": null,
+    "raw_count": 5,
+    "developer": "VTP Realty",
+    "developer_tier": "Tier 2 (Reputed Regional)",
+    "status": null,
+    "units": [
+      "1 BHK",
+      "2 BHK",
+      "3 BHK"
+    ],
+    "carpet_area": 1443.0,
+    "area_evidence": "Portal snippet: \"...3 BHK:** Carpet area of approximately 1,443 sq. ft...\"",
+    "rate_per_sqft": 14000.0,
+    "price_evidence": {
+      "price": 14000.0,
+      "source_title": "Verified Per-Sqft Rate Listing",
+      "snippet": "Portal snippet: \"....in/?utm_source=openai))\n\n- **Price per sq. ft.:** Approximately \u20b914,000 per sq. ft.\n\n**Unit Configura...\"",
+      "url": "https://www.vtpbellissimo.com/?utm_source=openai"
+    },
+    "total_comps": 48,
+    "qualified_comps": 16,
+    "market_rate": null,
+    "iqr_range": null,
+    "top_candidates": [
+      {
+        "Name": "Blue Ridge, Tower9",
+        "Distance (km)": 1.11,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 12,740",
+        "Unit Typology": "1 BHK, 2 BHK, 3 BHK, 4 BHK, 5 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "69.2%"
+      },
+      {
+        "Name": "Blue Ridge Tower 18",
+        "Distance (km)": 1.65,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 12,800",
+        "Unit Typology": "1 BHK, 2 BHK, 3 BHK, 4 BHK, 5 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "67.6%"
+      },
+      {
+        "Name": "Lodha Magnus - Hinjewadi Premium Project",
+        "Distance (km)": 1.4,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 16,109",
+        "Unit Typology": "3 BHK, 4 BHK, 5 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "57.7%"
+      },
+      {
+        "Name": "Godrej 24",
+        "Distance (km)": 0.18,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 12,017",
+        "Unit Typology": "\u2014",
+        "Unit Match": "Typology Unlisted",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "51.3%"
+      },
+      {
+        "Name": "Green Olive Apartments",
+        "Distance (km)": 1.15,
+        "Verified Rate (\u20b9/sqft)": "Rate Unlisted",
+        "Unit Typology": "3 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "69.4%"
+      }
+    ]
+  },
+  "tavily": {
+    "error": "ForbiddenError: This request exceeds the pay-as-you-go limit. You can increase your limit on the Tavily dashboard.",
+    "raw_count": 0,
+    "developer": "VTP Realty",
+    "developer_tier": "Tier 2 (Reputed Regional)",
+    "status": null,
+    "units": [],
+    "carpet_area": null,
+    "area_evidence": null,
+    "rate_per_sqft": null,
+    "price_evidence": null,
+    "total_comps": 47,
+    "qualified_comps": 12,
+    "market_rate": null,
+    "iqr_range": null,
+    "top_candidates": [
+      {
+        "Name": "Blue Ridge, Tower 7 (T7)",
+        "Distance (km)": 1.13,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 9,241",
+        "Unit Typology": "1 BHK, 2 BHK, 3 BHK, 4 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "84.4%"
+      },
+      {
+        "Name": "Palm Springs",
+        "Distance (km)": 2.59,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 8,885",
+        "Unit Typology": "1 BHK, 2 BHK, 3 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "73.9%"
+      },
+      {
+        "Name": "Godrej Elements",
+        "Distance (km)": 0.18,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 9,048",
+        "Unit Typology": "2 BHK, 3 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "70.0%"
+      },
+      {
+        "Name": "Wisteriaa Cooperative Housing Society",
+        "Distance (km)": 2.77,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 10,310",
+        "Unit Typology": "3 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "47.7%"
+      },
+      {
+        "Name": "Blue Ridge Main Entry",
+        "Distance (km)": 0.84,
+        "Verified Rate (\u20b9/sqft)": "\u20b9 9,924",
+        "Unit Typology": "2 BHK, 3 BHK",
+        "Unit Match": "\u2705 Matches (3 BHK)",
+        "Status": "\u2705 Qualified Match",
+        "Valuation Match": "54.7%"
+      }
+    ]
+  }
+}

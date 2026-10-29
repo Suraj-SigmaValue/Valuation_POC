@@ -7,9 +7,11 @@ Unified Streamlit Dashboard integrating:
 """
 
 import os
+import time
 import html
 import warnings
 import importlib
+import concurrent.futures
 
 # Suppress library deprecation and package rename warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -172,24 +174,52 @@ with st.sidebar:
     )
 
     if input_mode == "Project / Location Name":
-        project_name = st.text_input(
-            "Project / Locality Name:",
+        project_name_input = st.text_input(
+            "Project / Locality Name or Coordinates:",
             value="Bandra Kurla Complex, Mumbai",
-            placeholder="e.g. Bandra Kurla Complex, Mumbai",
-            help="Enter any custom project or locality name. Coordinates will be geocoded automatically.",
+            placeholder="e.g. Godrej Infinity Pune OR 18.539574, 73.9463397",
+            help="Enter any project or locality name, or paste coordinates directly (e.g. 18.539574, 73.9463397).",
         )
-        input_lat = None
-        input_lng = None
+        detected_coords = utils.parse_coordinates(project_name_input)
+        if detected_coords:
+            input_lat, input_lng = detected_coords
+            st.success(f"📍 Auto-Detected Coordinates: `{input_lat:.6f}, {input_lng:.6f}`")
+            project_name = project_name_input
+        else:
+            input_lat = None
+            input_lng = None
+            project_name = project_name_input
     else:
-        col_lat, col_lng = st.columns(2)
-        with col_lat:
-            input_lat = st.number_input("Latitude:", value=19.0660, format="%.6f")
-        with col_lng:
-            input_lng = st.number_input("Longitude:", value=72.8670, format="%.6f")
+        # Coordinates (Lat / Long) input mode
+        coord_raw = st.text_input(
+            "Coordinates (Paste Lat, Long):",
+            value="19.066000, 72.867000",
+            placeholder="e.g. 18.539574, 73.9463397",
+            help="Paste coordinates copied directly from Google Maps (e.g. 18.539574, 73.9463397).",
+        )
+        parsed_c = utils.parse_coordinates(coord_raw)
+        if parsed_c:
+            input_lat, input_lng = parsed_c
+        else:
+            # Fallback to separate manual inputs if free-form string doesn't match standard pair
+            col_lat, col_lng = st.columns(2)
+            with col_lat:
+                lat_str = st.text_input("Latitude:", value="19.066000")
+            with col_lng:
+                lng_str = st.text_input("Longitude:", value="72.867000")
+            try:
+                input_lat = float(lat_str.strip())
+                input_lng = float(lng_str.strip())
+            except ValueError:
+                input_lat, input_lng = 19.0660, 72.8670
+
+        st.caption(f"📍 Active Coordinates: **{input_lat:.6f}, {input_lng:.6f}**")
+
         project_name = st.text_input(
             "Project / Site Label (Optional):",
             value="Custom Subject Property",
-            placeholder="e.g. My Valuation Site",
+            placeholder="e.g. Godrej Infinity / My Valuation Site",
+            help="Optional label. If left default, real project name and address are auto-resolved from coordinates.",
         )
 
     st.markdown("---")
@@ -211,27 +241,51 @@ with st.sidebar:
         chosen_radius_km = st.slider("Custom Radius (km):", min_value=0.5, max_value=25.0, value=5.0, step=0.5)
 
     st.markdown("---")
-    st.subheader("🎯 3. Valuation Benchmark Mode")
-    st.caption(
-        "🤖 **100% Automated**: Property type, unit typology, carpet area, and benchmark rate are all automatically discovered from real estate web evidence for your subject project."
+    st.subheader("🏢 3. Target Configuration & Property Type")
+    st.caption("Select the desired property configuration to discover and filter comparables.")
+
+    config_options = [
+        "🤖 Auto-Detect from Subject Site",
+        "🏢 Flat - 1 BHK",
+        "🏢 Flat - 2 BHK",
+        "🏢 Flat - 3 BHK",
+        "🏢 Flat - 4 BHK",
+        "🏢 Flat - > 4 BHK (5+ BHK / Penthouse / Duplex)",
+        "🏢 Residential Flat (Any Typology)",
+        "🛍️ Shop (Commercial Retail / Showroom)",
+        "💼 Office (Commercial / Tech Park)",
+        "🏗️ Other (Mixed-Use / Plots)",
+    ]
+
+    selected_config_choice = st.selectbox(
+        "Select Desired Configuration:",
+        options=config_options,
+        index=0,
+        help="Filter comparables to match this specific property type or unit configuration."
     )
 
-    with st.expander("⚙️ Optional Manual Overrides", expanded=False):
+    strict_config_match = st.checkbox(
+        "Strict Unit Filter: Show ONLY projects with verified evidence of this configuration",
+        value=False,
+        help="When unchecked (recommended), all nearby projects within the search radius are displayed, with matching configurations prioritized at the top."
+    )
+
+    st.markdown("---")
+    st.subheader("⚖️ 4. Valuation Benchmark & Overrides")
+    st.caption(
+        "🤖 **100% Automated**: Benchmark rate and specs are auto-discovered from real estate web evidence."
+    )
+
+    with st.expander("⚙️ Optional Manual Overrides & Tolerances", expanded=False):
         override_active = st.checkbox("Enable manual parameter overrides", value=False)
         if override_active:
-            prop_choice = st.selectbox(
-                "Property Type Override:",
-                options=["Auto-Detect from Site", "Flat (Residential)", "Shop (Retail)", "Office (Corporate)", "Others (Mixed-Use)"],
-                index=0
-            )
-            unit_override = st.text_input("Unit Typology Override:", value="", placeholder="Leave blank for auto-detected unit (e.g. 2 BHK)")
-            area_override = st.number_input("Carpet Area Override (sq.ft):", min_value=0.0, value=0.0, step=50.0, help="Set 0 for auto-detection")
             rate_override = st.number_input("Benchmark Rate Override (₹ / sq.ft):", min_value=0.0, value=0.0, step=500.0, help="Set 0 for auto-detection")
+            area_override = st.number_input("Carpet Area Override (sq.ft):", min_value=0.0, value=0.0, step=50.0, help="Set 0 for auto-detection")
+            unit_override = st.text_input("Custom Unit Override:", value="", placeholder="e.g. 2.5 BHK / Studio (optional)")
         else:
-            prop_choice = "Auto-Detect from Site"
-            unit_override = None
-            area_override = None
             rate_override = None
+            area_override = None
+            unit_override = None
 
         area_tolerance = st.slider(
             "Area Tolerance (± %):",
@@ -241,39 +295,78 @@ with st.sidebar:
         )
 
         filter_qualified_toggle = st.checkbox(
-            "Filter only Qualified Comparables (All 4 Criteria Matched)",
+            "Filter only Qualified Comparables (All Criteria Matched)",
             value=False,
             help="Show only properties matching: Same Property Type + Same Unit + Carpet Area in Range + Price in 80%–120%."
         )
 
-    if "flat" in prop_choice.lower():
+    # Resolve property type and unit from target configuration
+    if "1 bhk" in selected_config_choice.lower():
         selected_prop_type = "flat"
-    elif "shop" in prop_choice.lower():
+        selected_unit = "1 BHK"
+    elif "2 bhk" in selected_config_choice.lower():
+        selected_prop_type = "flat"
+        selected_unit = "2 BHK"
+    elif "3 bhk" in selected_config_choice.lower():
+        selected_prop_type = "flat"
+        selected_unit = "3 BHK"
+    elif "4 bhk" in selected_config_choice.lower():
+        selected_prop_type = "flat"
+        selected_unit = "4 BHK"
+    elif any(k in selected_config_choice.lower() for k in ["> 4", "5", "penthouse"]):
+        selected_prop_type = "flat"
+        selected_unit = "> 4 BHK"
+    elif "flat" in selected_config_choice.lower():
+        selected_prop_type = "flat"
+        selected_unit = unit_override.strip() if (unit_override and unit_override.strip()) else None
+    elif "shop" in selected_config_choice.lower():
         selected_prop_type = "shop"
-    elif "office" in prop_choice.lower():
+        selected_unit = "Retail Shop"
+    elif "office" in selected_config_choice.lower():
         selected_prop_type = "office"
-    elif "other" in prop_choice.lower():
+        selected_unit = "Office Space"
+    elif "other" in selected_config_choice.lower():
         selected_prop_type = "others"
+        selected_unit = "Mixed-Use"
     else:
         selected_prop_type = None
+        selected_unit = unit_override.strip() if (unit_override and unit_override.strip()) else None
 
     source_bench_rate = float(rate_override) if (rate_override and rate_override > 0) else None
-    selected_unit = unit_override.strip() if (unit_override and unit_override.strip()) else None
     source_bench_area = float(area_override) if (area_override and area_override > 0) else None
 
     st.markdown("---")
-    st.subheader("⚙️ 4. System Status & Search")
+    st.subheader("⚙️ 5. System Status & Search")
 
     # API Keys are loaded purely from .env without exposing in UI
     has_google_key = bool(utils.get_google_api_key())
+    has_tavily_key = bool(utils.get_tavily_api_key())
+    has_openai_key = bool(utils.get_openai_api_key())
+
     if has_google_key:
         st.success("Google Places API: Active (.env)", icon="✅")
     else:
         st.info("Google Places API: Demo Mode\n(Add GOOGLE_PLACES_API_KEY in .env for live API)", icon="💡")
 
+    # Search Tool Stack Status (Priority: 1. OpenAI -> 2. DuckDuckGo -> 3. Tavily)
+    stack_items = []
+    if has_openai_key:
+        stack_items.append("1. OpenAI Web (Primary)")
+    else:
+        stack_items.append("1. OpenAI (Awaiting Key in .env)")
+    stack_items.append("2. DuckDuckGo (Fallback)")
+    if has_tavily_key:
+        stack_items.append("3. Tavily AI")
+    st.caption(f"🔍 **Active Fallback Chain**: {' ➔ '.join(stack_items)}")
+
     search_engine_choice = st.selectbox(
-        "CBD Web Search Engine:",
-        options=["DuckDuckGo (Free / No Key)", "Tavily AI Search (from .env)"],
+        "Web Search Fallback Strategy:",
+        options=[
+            "Auto-Fallback (1. OpenAI ➔ 2. DuckDuckGo ➔ 3. Tavily)",
+            "OpenAI Web Search (Priority 1)",
+            "DuckDuckGo Only (Priority 2 / Free)",
+            "Tavily AI Search (from .env)",
+        ],
         index=0,
     )
 
@@ -293,6 +386,8 @@ current_params = {
     "lat": round(float(input_lat), 5) if input_lat is not None else None,
     "lng": round(float(input_lng), 5) if input_lng is not None else None,
     "radius_km": float(chosen_radius_km),
+    "target_config": selected_config_choice,
+    "strict_config": bool(strict_config_match),
     "prop_type": selected_prop_type,
     "source_rate": source_bench_rate,
     "source_unit": selected_unit,
@@ -303,6 +398,76 @@ current_params = {
 }
 
 # Automatically re-run when parameters change or clicks Run
+@st.cache_data(ttl=3600, show_spinner=False)
+def execute_cached_valuation_analysis(
+    resolved_lat: float,
+    resolved_lng: float,
+    resolved_name: str,
+    chosen_radius_km: float,
+    selected_prop_type: str,
+    source_bench_rate: float,
+    selected_unit: str,
+    source_bench_area: float,
+    area_tolerance: float,
+    filter_qualified_toggle: bool,
+    selected_config_choice: str,
+    strict_config_match: bool,
+    pref_engine: str,
+):
+    active_google_key = utils.get_google_api_key()
+    tavily_key = utils.get_tavily_api_key()
+    openai_key = utils.get_openai_api_key()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        future_comp = pool.submit(
+            comparable.find_comparable_projects,
+            lat=resolved_lat,
+            lng=resolved_lng,
+            project_name=resolved_name,
+            radius_km=chosen_radius_km,
+            property_type=selected_prop_type,
+            source_rate=source_bench_rate,
+            source_unit=selected_unit,
+            source_area=source_bench_area,
+            area_tolerance_pct=area_tolerance,
+            filter_qualified_only=filter_qualified_toggle,
+            target_configuration=selected_config_choice,
+            strict_configuration_match=strict_config_match,
+            api_key=active_google_key,
+            tavily_key=tavily_key,
+            openai_key=openai_key,
+            preferred_engine=pref_engine,
+        )
+        future_cbd = pool.submit(
+            cbd.analyze_cbd,
+            lat=resolved_lat,
+            lng=resolved_lng,
+            project_name=resolved_name,
+            search_engine=pref_engine,
+            tavily_key=tavily_key,
+            openai_key=openai_key,
+            google_key=active_google_key,
+        )
+        future_amenity = pool.submit(
+            neighborehood_amenity.fetch_neighborhood_amenities,
+            lat=resolved_lat,
+            lng=resolved_lng,
+            project_name=resolved_name,
+            radius_km=chosen_radius_km,
+            api_key=active_google_key,
+        )
+
+        comp_result = future_comp.result()
+        cbd_result = future_cbd.result()
+        amenity_result = future_amenity.result()
+
+    return {
+        "comparables": comp_result,
+        "cbd": cbd_result,
+        "amenities": amenity_result,
+    }
+
+
 should_run = (
     run_btn
     or "analysis_data" not in st.session_state
@@ -310,51 +475,64 @@ should_run = (
 )
 
 if should_run:
-    with st.spinner("Analyzing site micro-market & auto-extracting property DNA..."):
+    start_analysis_time = time.time()
+    with st.status("🚀 Launching AI Valuation & Site Intelligence...", expanded=True) as status_box:
         try:
-            # Keys loaded automatically from .env
+            # 0. Pre-resolve subject site coordinates in < 0.1s
             active_google_key = utils.get_google_api_key()
-            tavily_key = utils.get_tavily_api_key() if "Tavily" in search_engine_choice else None
+            if input_lat is not None and input_lng is not None:
+                resolved_lat, resolved_lng = input_lat, input_lng
+                resolved_name = project_name or f"Subject Site ({resolved_lat:.4f}, {resolved_lng:.4f})"
+                resolved_addr = resolved_name
+                resolved_city = "Metropolitan Area"
+            elif project_name:
+                geo = utils.geocode_project(project_name, api_key=active_google_key)
+                resolved_lat = geo["lat"]
+                resolved_lng = geo["lng"]
+                resolved_name = geo.get("name", project_name)
+                resolved_addr = geo.get("formatted_address", "")
+                resolved_city = geo.get("city", "Metropolitan Area")
+            else:
+                raise ValueError("Must provide either Coordinates or Project / Location Name.")
 
-            # 1. Fetch Comparable Projects with 4-Point Auto-Discovered Baseline
-            comp_result = comparable.find_comparable_projects(
-                lat=input_lat,
-                lng=input_lng,
-                project_name=project_name if (input_mode == "Project / Location Name" or project_name) else None,
-                radius_km=chosen_radius_km,
-                property_type=selected_prop_type,
-                source_rate=source_bench_rate,
-                source_unit=selected_unit,
-                source_area=source_bench_area,
-                area_tolerance_pct=area_tolerance,
-                filter_qualified_only=filter_qualified_toggle,
-                api_key=active_google_key,
+            status_box.write(f"📍 Anchored site coordinates: `{resolved_lat:.5f}, {resolved_lng:.5f}` ({resolved_name})")
+
+            if "OpenAI" in search_engine_choice:
+                pref_engine = "openai"
+            elif "DuckDuckGo" in search_engine_choice:
+                pref_engine = "duckduckgo"
+            elif "Tavily" in search_engine_choice:
+                pref_engine = "tavily"
+            else:
+                pref_engine = "auto"
+
+            status_box.write("⚡ Concurrently extracting Comparables, CBD corridors, and Neighborhood Amenities...")
+
+            results = execute_cached_valuation_analysis(
+                resolved_lat=resolved_lat,
+                resolved_lng=resolved_lng,
+                resolved_name=resolved_name,
+                chosen_radius_km=chosen_radius_km,
+                selected_prop_type=selected_prop_type,
+                source_bench_rate=source_bench_rate,
+                selected_unit=selected_unit,
+                source_bench_area=source_bench_area,
+                area_tolerance=area_tolerance,
+                filter_qualified_toggle=filter_qualified_toggle,
+                selected_config_choice=selected_config_choice,
+                strict_config_match=strict_config_match,
+                pref_engine=pref_engine,
             )
+
+            comp_result = results["comparables"]
+            cbd_result = results["cbd"]
+            amenity_result = results["amenities"]
 
             resolved_lat = comp_result["subject_site"]["lat"]
             resolved_lng = comp_result["subject_site"]["lng"]
             resolved_name = comp_result["subject_site"]["name"]
             resolved_addr = comp_result["subject_site"]["address"]
             resolved_city = comp_result["subject_site"]["city"]
-
-            # 2. Fetch CBD Analysis via LangGraph Deep Agent
-            cbd_result = cbd.analyze_cbd(
-                lat=resolved_lat,
-                lng=resolved_lng,
-                project_name=resolved_name,
-                search_engine="tavily" if "Tavily" in search_engine_choice else "duckduckgo",
-                tavily_key=tavily_key,
-                google_key=active_google_key,
-            )
-
-            # 3. Fetch Amenities
-            amenity_result = neighborehood_amenity.fetch_neighborhood_amenities(
-                lat=resolved_lat,
-                lng=resolved_lng,
-                project_name=resolved_name,
-                radius_km=chosen_radius_km,
-                api_key=active_google_key,
-            )
 
             st.session_state["analysis_data"] = {
                 "comparables": comp_result,
@@ -371,7 +549,17 @@ if should_run:
                 "property_type": selected_prop_type,
             }
             st.session_state["last_params"] = current_params
+
+            elapsed_total = time.time() - start_analysis_time
+            n_comps = len(comp_result.get("comparables", []))
+            n_cbds = len(cbd_result.get("cbds", []))
+            n_amens = len(amenity_result.get("amenities", []))
+
+            status_box.write(f"✅ Intelligence synthesized in **{elapsed_total:.1f}s**: {n_comps} comparables, {n_cbds} CBD hubs, {n_amens} neighborhood amenities.")
+            status_box.update(label=f"Valuation Analysis Complete ({elapsed_total:.1f}s)", state="complete", expanded=False)
+
         except Exception as e:
+            status_box.update(label="Analysis Error", state="error", expanded=True)
             st.error(f"Error during analysis: {str(e)}")
 
 # Display Results
@@ -425,15 +613,18 @@ if "analysis_data" in st.session_state:
     # ================= TAB 1: COMPARABLE PROJECTS =================
     with tab_comp:
         st.subheader("🏢 Comparable Real Estate Projects & Valuation Matching")
-        st.caption(f"Showing nearby projects within **{data['radius_km']} km** matching property filter: **{comp_data['property_type']}**")
+        active_config_title = comp_data.get("target_configuration") or comp_data.get("property_type", "Residential Flat")
+        is_strict = comp_data.get("strict_configuration_match", False)
+        strict_text = " [Strict Match Active]" if is_strict else ""
+        st.caption(f"Showing nearby projects within **{data['radius_km']} km** matching configuration: **{active_config_title}**{strict_text} (**{len(comp_data.get('comparables', []))}** comparable projects found)")
 
         vp = comp_data.get("valuation_parameters", {})
         comps = comp_data.get("comparables", [])
 
         # Valuation Benchmark Target Banner (80% to 120%)
         rate_val = vp.get("source_rate")
-        unit_val = vp.get("source_unit", "2 BHK")
-        area_val = vp.get("source_area", 850.0)
+        unit_val = vp.get("source_unit") or "Typical Typology"
+        area_val = vp.get("source_area")
         prop_label = comp_data.get("property_type", "Residential Flat")
         subj_ev = vp.get("subject_price_evidence") or site.get("price_evidence") or {}
 
@@ -441,12 +632,22 @@ if "analysis_data" in st.session_state:
             clean_subj_title = html.escape((subj_ev.get("source_title") or "Verified Portal Listing")[:45])
             subj_url = html.escape(subj_ev.get("url", "#"))
             ev_link = f' <a href="{subj_url}" target="_blank" style="color: #38bdf8; text-decoration: underline;">({clean_subj_title} ↗)</a>' if subj_ev.get("url") else ""
-            discovered_tag = " (Auto-Discovered)" if vp.get("rate_discovered") else " (Custom Override)"
+            if vp.get("is_manual_override") or vp.get("rate_source_type") == "manual_override":
+                discovered_tag = " (Custom Override)"
+            elif vp.get("is_cluster_median") or vp.get("rate_source_type") == "cluster_median":
+                discovered_tag = " (Locality Cluster Median)"
+            elif vp.get("rate_discovered"):
+                discovered_tag = " (Auto-Discovered)"
+            else:
+                discovered_tag = " (Locality Cluster Median)"
             rate_info = f'Source Rate: <b style="color: #38bdf8;">₹{rate_val:,.0f} / sq.ft</b>{discovered_tag}{ev_link} <span style="color: #94a3b8;">(80%–120%: <b>₹{vp.get("min_rate", 0):,.0f} — ₹{vp.get("max_rate", 0):,.0f}</b>)</span>'
         else:
-            rate_info = 'Source Rate: <i style="color: #fbbf24;">Rate not disclosed on web for subject property</i>'
+            rate_info = 'Source Rate: <i style="color: #fbbf24;">Rate unlisted on web for subject property</i>'
 
-        area_info = f'Carpet Area: <b style="color: #fcd34d;">{area_val:,.0f} sq.ft</b> <span style="color: #94a3b8;">(±15%: <b>{vp.get("min_area", 0):,.0f} — {vp.get("max_area", 0):,.0f} sq.ft</b>)</span>' if area_val else 'Carpet Area: <b style="color: #fcd34d;">Standard Area</b>'
+        if area_val:
+            area_info = f'Carpet Area: <b style="color: #fcd34d;">{area_val:,.0f} sq.ft</b> <span style="color: #94a3b8;">(±15%: <b>{vp.get("min_area", 0):,.0f} — {vp.get("max_area", 0):,.0f} sq.ft</b>)</span>'
+        else:
+            area_info = 'Carpet Area: <i style="color: #fbbf24;">Area unlisted on web for subject property</i>'
 
         banner_html = (
             f'<div style="background: linear-gradient(135deg, rgba(30, 41, 59, 0.9) 0%, rgba(15, 23, 42, 0.9) 100%); border: 1px solid #3b82f6; border-radius: 10px; padding: 12px 18px; margin-bottom: 16px;">'
@@ -498,58 +699,113 @@ if "analysis_data" in st.session_state:
                     has_ev = bool(p.get("rate_per_sqft") is not None and p.get("price_evidence"))
                     ev = p.get("price_evidence") or {}
 
+                    dev_tier_badge = f'<span class="badge-pill badge-office">🏢 {html.escape(str(p.get("developer_segment", "Tier 2")))}</span>'
+                    scale_badge = f'<span class="badge-pill badge-others">🏗️ {html.escape(str(p.get("project_scale_type", "Gated Complex")))}</span>'
+
                     if has_ev:
                         price_badge = (
                             '<span class="badge-pill badge-inrange">✅ In 80%–120% Range</span>'
                             if v_match.get("price_match")
-                            else '<span class="badge-pill badge-outrange">❌ Out of 80%–120% Range</span>'
+                            else f'<span class="badge-pill badge-outrange">{html.escape(str(v_match.get("price_status", "Price Verified")))}</span>'
                         )
                         status_badge = (
-                            '<span class="badge-pill badge-qualified">✅ Qualified Match</span>'
+                            '<span class="badge-pill badge-qualified">✅ Full Valuation Match</span>'
                             if p.get("is_qualified")
                             else '<span class="badge-pill badge-partial">⚠️ Partial Match</span>'
-                        )
-                        unit_badge = (
-                            f'<span class="badge-pill badge-qualified">🛏️ {p["available_units"][0] if p.get("available_units") else vp.get("source_unit", "2 BHK")}</span>'
-                            if v_match.get("unit_match")
-                            else '<span class="badge-pill badge-outrange">🛏️ Unit Mismatch</span>'
-                        )
-                        area_badge = (
-                            f'<span class="badge-pill badge-inrange">📐 Area in Range</span>'
-                            if v_match.get("area_match")
-                            else '<span class="badge-pill badge-outrange">📐 Area Mismatch</span>'
                         )
                         price_html = f'<p style="margin: 3px 0; color: #f8fafc; font-size: 0.95rem;">💰 Verified Rate: <b>₹{p["rate_per_sqft"]:,.0f} / sq.ft</b></p>'
                         clean_title = html.escape((ev.get("source_title") or "Listing Source")[:45])
                         raw_snip = (ev.get("snippet") or "")[:140].replace("\r", " ").replace("\n", " ")
                         clean_snippet = html.escape(raw_snip)
                         clean_ev_url = html.escape(ev.get("url", "#"))
+                        status_ev_line = ""
+                        if p.get("status_evidence"):
+                            status_ev_line += f'<p style="margin: 3px 0 0 0; color: #a7f3d0; font-size: 0.74rem;">⏳ <b>Status Evidence:</b> {html.escape(str(p.get("status_evidence") or ""))}</p>'
+                        if p.get("age_evidence"):
+                            status_ev_line += f'<p style="margin: 3px 0 0 0; color: #93c5fd; font-size: 0.74rem;">📅 <b>Age Evidence:</b> {html.escape(str(p.get("age_evidence") or ""))}</p>'
                         evidence_box = (
                             f'<div style="background: rgba(15, 23, 42, 0.7); border-left: 3px solid #10b981; border-radius: 4px; padding: 6px 10px; margin: 8px 0; font-size: 0.78rem;">'
                             f'<span style="color: #6ee7b7; font-weight: 600;">📑 Price Evidence:</span> '
                             f'<a href="{clean_ev_url}" target="_blank" style="color: #38bdf8; text-decoration: none; font-weight: 500;">{clean_title} ↗</a>'
                             f'<p style="margin: 4px 0 0 0; color: #94a3b8; font-size: 0.74rem; line-height: 1.3;">"{clean_snippet}..."</p>'
+                            f'{status_ev_line}'
                             f'</div>'
                         )
                     else:
-                        price_badge = '<span class="badge-pill badge-source">⚠️ No Price Evidence</span>'
-                        status_badge = '<span class="badge-pill badge-partial">⚠️ Price Unverified</span>'
-                        unit_badge = '<span class="badge-pill badge-source">🛏️ Unit Unverified</span>'
-                        area_badge = '<span class="badge-pill badge-source">📐 Area Unverified</span>'
-                        price_html = '<p style="margin: 3px 0; color: #94a3b8; font-size: 0.85rem;">💰 Price: <i>Not Disclosed / No Verified Web Evidence</i></p>'
+                        if p.get("is_qualified"):
+                            price_badge = '<span class="badge-pill badge-inrange">🏢 Physical Proxy</span>'
+                            status_badge = '<span class="badge-pill badge-qualified">🏢 Physical Equivalence</span>'
+                        elif v_match.get("captured_count", 0) == 0:
+                            price_badge = '<span class="badge-pill badge-outrange">Rate Unlisted</span>'
+                            status_badge = '<span class="badge-pill badge-outrange">❌ Insufficient Data</span>'
+                        else:
+                            price_badge = '<span class="badge-pill badge-inrange">🏢 Physical Proxy</span>'
+                            status_badge = '<span class="badge-pill badge-partial">⚠️ Low Match</span>'
+                        price_html = '<p style="margin: 3px 0; color: #94a3b8; font-size: 0.88rem;">💰 Verified Rate: <i>Rate Unlisted</i></p>'
+                        area_snip = html.escape((p.get("area_evidence") or "Area unlisted in sources")[:90])
+                        dev_snip = html.escape((p.get("developer_evidence") or "Developer unlisted in sources")[:90])
+                        status_snip = html.escape((p.get("status_evidence") or "Status unlisted in sources")[:90])
+                        age_snip = html.escape((p.get("age_evidence") or "Age unlisted in sources")[:90])
                         evidence_box = (
-                            f'<div style="background: rgba(15, 23, 42, 0.4); border-left: 3px solid #475569; border-radius: 4px; padding: 6px 10px; margin: 8px 0; font-size: 0.75rem; color: #94a3b8;">'
-                            f'Price not disclosed on web. Search real estate portals manually below.'
+                            f'<div style="background: rgba(15, 23, 42, 0.5); border-left: 3px solid #38bdf8; border-radius: 4px; padding: 6px 10px; margin: 8px 0; font-size: 0.75rem; color: #94a3b8;">'
+                            f'<span style="color: #38bdf8; font-weight: 600;">⚖️ Physical Evidence Trail:</span><br>'
+                            f'• <b>Area Evidence:</b> {area_snip}<br>'
+                            f'• <b>Developer Evidence:</b> {dev_snip}<br>'
+                            f'• <b>Status Evidence:</b> {status_snip}<br>'
+                            f'• <b>Age Evidence:</b> {age_snip}'
                             f'</div>'
                         )
 
+                    if p.get("available_units"):
+                        unit_badge = (
+                            f'<span class="badge-pill badge-qualified">🛏️ {p["available_units"][0]}</span>'
+                            if v_match.get("unit_match", True)
+                            else '<span class="badge-pill badge-outrange">🛏️ Unit Mismatch</span>'
+                        )
+                    else:
+                        unit_badge = '<span class="badge-pill badge-outrange">🛏️ Unit Unlisted</span>'
+
+                    if p.get("carpet_area"):
+                        area_badge = (
+                            f'<span class="badge-pill badge-inrange">📐 Area in Range</span>'
+                            if v_match.get("area_match", True)
+                            else '<span class="badge-pill badge-outrange">📐 Area Mismatch</span>'
+                        )
+                    else:
+                        area_badge = '<span class="badge-pill badge-outrange">📐 Area Unlisted</span>'
+
                     source_name = html.escape(str(p.get("source", "Google Places API")))
                     source_badge = f'<span class="badge-pill badge-source">🌐 {source_name}</span>'
-                    carpet_str = f"{p['carpet_area']:,} sq.ft" if p.get("carpet_area") else "Complex Standard"
-                    units_str = html.escape(", ".join(p.get("available_units", [])))
+                    carpet_str = f"{int(p['carpet_area']):,} sq.ft" if p.get("carpet_area") else "—"
+                    units_str = html.escape(", ".join(p.get("available_units", []))) if p.get("available_units") else "—"
                     prop_name = html.escape(str(p.get("name", "Project")))
                     maps_url = html.escape(str(p.get("google_maps_url", "#")))
-                    search_url = html.escape(str(p.get("web_search_url", "#")))
+                    ev_link_url = html.escape(str(ev.get("url") or p.get("evidence_url") or "#"))
+
+                    evidence_link_html = (
+                        f'<a href="{ev_link_url}" target="_blank" style="color: #34d399; font-size: 0.8rem; text-decoration: none;">View Evidence ↗</a>'
+                        if ev_link_url != "#" else ""
+                    )
+
+                    c_status_card = p.get("construction_status")
+                    status_str = c_status_card if c_status_card else "Status Unlisted"
+                    poss_yr_c = p.get("possession_year")
+                    age_c = p.get("estimated_project_age_years")
+                    if c_status_card == "Under Construction":
+                        age_str = f"UC (Possession: {poss_yr_c})" if poss_yr_c else "Under Construction"
+                    elif age_c is not None:
+                        if age_c == 0 or age_c == 0.5:
+                            age_str = "RTM (< 1 yr)"
+                        elif age_c == 1:
+                            age_str = "RTM (1 yr)"
+                        else:
+                            age_disp_c = f"{age_c:g}" if isinstance(age_c, float) else f"{age_c}"
+                            age_str = f"RTM ({age_disp_c} yrs)"
+                    else:
+                        age_str = "Age Unlisted"
+
+                    status_badge_html = f'<span class="badge-pill badge-office">⏳ {html.escape(status_str)}</span>'
+                    age_badge_html = f'<span class="badge-pill badge-others">📅 {html.escape(age_str)}</span>'
 
                     card_html = (
                         f'<div class="prop-card">'
@@ -557,16 +813,16 @@ if "analysis_data" in st.session_state:
                         f'<h4 style="margin: 0; color: #38bdf8; font-size: 1.05rem;">{prop_name}</h4>'
                         f'<span style="font-weight: 700; color: #38bdf8; font-size: 1.05rem;">{p.get("match_score", 0):.1f}%</span>'
                         f'</div>'
-                        f'<div style="margin: 6px 0 8px 0; display: flex; flex-wrap: wrap; gap: 4px;">{status_badge} {price_badge} {unit_badge} {area_badge}</div>'
+                        f'<div style="margin: 6px 0 8px 0; display: flex; flex-wrap: wrap; gap: 4px;">{status_badge} {price_badge} {status_badge_html} {age_badge_html} {dev_tier_badge} {scale_badge} {unit_badge} {area_badge}</div>'
                         f'{price_html}'
-                        f'<p style="margin: 3px 0; color: #e2e8f0; font-size: 0.85rem;">📐 Carpet Area: <b>{carpet_str}</b> | Units: <b>{units_str}</b></p>'
+                        f'<p style="margin: 3px 0; color: #e2e8f0; font-size: 0.85rem;">⏳ Status: <b>{status_str}</b> | 📅 Age: <b>{age_str}</b> | 📐 Carpet: <b>{carpet_str}</b> | Units: <b>{units_str}</b></p>'
                         f'<p style="margin: 3px 0; color: #e2e8f0; font-size: 0.85rem;">📍 <b>{p["distance_km"]} km</b> from subject site</p>'
                         f'<p style="margin: 3px 0; color: #94a3b8; font-size: 0.8rem;">⭐ Rating: <b>{p.get("rating", "N/A")}</b> ({p.get("user_ratings_total", 0)} reviews)</p>'
                         f'{evidence_box}'
                         f'<div style="margin-top: 8px;">{source_badge}</div>'
                         f'<div style="margin-top: 10px; display: flex; gap: 12px;">'
                         f'<a href="{maps_url}" target="_blank" style="color: #60a5fa; font-size: 0.8rem; text-decoration: none;">Google Maps ↗</a>'
-                        f'<a href="{search_url}" target="_blank" style="color: #34d399; font-size: 0.8rem; text-decoration: none;">Search 99acres ↗</a>'
+                        f'{evidence_link_html}'
                         f'</div>'
                         f'</div>'
                     )
@@ -581,18 +837,19 @@ if "analysis_data" in st.session_state:
             cols_to_display = [
                 c for c in [
                     "Name", "Distance (km)", "Verified Rate (₹/sqft)", "In 80%–120% Range?",
-                    "Unit Typology", "Carpet Area (sqft)", "Area Match",
-                    "Price Evidence Source", "Evidence URL", "Valuation Match",
-                    "Status", "Google Maps", "Portal Search"
+                    "Price Evidence", "Carpet Area (sqft)", "Area Match", "Carpet Area Evidence",
+                    "Unit Typology", "Unit Match", "Unit Evidence", "Developer", "Developer Tier", "Developer Evidence",
+                    "Construction Status", "Status Evidence", "Building Age", "Age Evidence",
+                    "Scale & Typology", "Scale Evidence",
+                    "Evaluation Basis", "Valuation Match", "Status", "Evidence Citation", "Google Maps"
                 ] if c in df_comps.columns
             ]
             st.dataframe(
                 df_comps[cols_to_display],
                 width="stretch",
                 column_config={
-                    "Evidence URL": st.column_config.LinkColumn("Evidence Citation", display_text="View Evidence ↗"),
+                    "Evidence Citation": st.column_config.LinkColumn("Evidence Citation", display_text="View Evidence ↗"),
                     "Google Maps": st.column_config.LinkColumn("Map Link", display_text="Open Map ↗"),
-                    "Portal Search": st.column_config.LinkColumn("Portal Search", display_text="Search 99acres ↗"),
                     "Distance (km)": st.column_config.NumberColumn(format="%.2f km"),
                 },
             )
